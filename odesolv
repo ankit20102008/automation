@@ -3,3 +3,45 @@ def normalize_header(text):
         return ""
     text = str(text).strip().replace("_", " ")
     return re.sub(r"\s+", " ", text).lower()
+
+wb  = load_workbook(filepath, data_only=True)
+ws  = wb.active
+tag_value_map = {}
+warnings      = []
+seen          = defaultdict(int)
+
+
+headers = [normalize_header(cell.value) for cell in ws[1]]
+
+try:
+    tag_col_idx = headers.index("tag generic name")
+except ValueError:
+    raise ValueError(
+        f"'tag generic name' column not found in {filepath}. "
+        f"Detected headers: {headers}"
+    )
+
+try:
+    value_col_idx = headers.index("value")
+except ValueError:
+    raise ValueError(
+        f"'value' column not found in {filepath}. "
+        f"Detected headers: {headers}"
+
+
+
+
+raw_tag = row[tag_col_idx] if len(row) > tag_col_idx else None
+raw_val = row[value_col_idx] if len(row) > value_col_idx else None
+
+
+
+
+
+
+
+
+
+
+
+    )
