@@ -1,0 +1,5 @@
+def normalize_header(text):
+    if text is None:
+        return ""
+    text = str(text).strip().replace("_", " ")
+    return re.sub(r"\s+", " ", text).lower()
