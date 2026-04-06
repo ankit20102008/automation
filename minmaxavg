@@ -1,23 +1,39 @@
 import re
-from openpyxl import load_workbook
+from openpyxl import load_workbook, Workbook
 
-# ----------------------------
+# =========================================================
 # CONFIG
-# ----------------------------
+# =========================================================
 INPUT_FILE = "input.xlsx"
 OUTPUT_FILE = "output_converted.xlsx"
-SHEET_NAME = None   # None = first sheet, or put sheet name like "Sheet1"
 
-# For MIN, missing values are replaced by a very large number.
-# If your real values can be larger than this, increase it.
+INPUT_PI_SHEET = "pi_tag"
+INPUT_INFERRED_SHEET = "inferred_tag"
+
+OUTPUT_PI_SHEET = "pi_tags"
+OUTPUT_INFERRED_SHEET = "inferred_tags"
+
+# Data starts from this row (usually 2 if row 1 is header)
+START_ROW = 2
+
+# ---- PI TAG sheet source columns ----
+# You can give column letter OR header name
+PI_SHORT_NAME_COL = "A"
+PI_NAME_COL = "B"
+
+# ---- INFERRED TAG sheet source columns ----
+# You can give column letter OR header name
+INFERRED_SHORT_NAME_COL = "A"
+INFERRED_FORMULA_COL = "E"
+
+# For MIN, missing values are replaced by a very large number
 MIN_SENTINEL = "1e99"
 
 
-# ----------------------------
-# HELPERS
-# ----------------------------
+# =========================================================
+# FORMULA PARSER / CONVERTER
+# =========================================================
 def split_top_level_args(s: str):
-    """Split function arguments by comma, but only at top level."""
     args = []
     buf = []
     depth = 0
@@ -60,7 +76,6 @@ def split_top_level_args(s: str):
 
 
 def find_matching_paren(text: str, open_pos: int):
-    """Find matching ')' for '(' at open_pos."""
     depth = 0
     in_string = False
     string_char = ""
@@ -126,33 +141,25 @@ def build_min(args):
 
 
 def transform_expression(expr: str):
-    """
-    Recursively transform avg(...), min(...), max(...)
-    even when they are inside bigger formulas.
-    """
     result = []
     i = 0
 
     while i < len(expr):
         ch = expr[i]
 
-        # Detect function name
         if ch.isalpha() or ch == "_":
             start = i
             while i < len(expr) and (expr[i].isalnum() or expr[i] == "_"):
                 i += 1
             func_name = expr[start:i]
 
-            # Skip spaces after function name
             j = i
             while j < len(expr) and expr[j].isspace():
                 j += 1
 
-            # Function call?
             if j < len(expr) and expr[j] == "(":
                 end = find_matching_paren(expr, j)
                 if end == -1:
-                    # Broken formula, keep as is
                     result.append(expr[start:])
                     break
 
@@ -183,7 +190,6 @@ def transform_expression(expr: str):
 
 
 def convert_formula(text: str):
-    """Preserve leading '=' if present."""
     if not isinstance(text, str):
         return text
 
@@ -191,7 +197,7 @@ def convert_formula(text: str):
     stripped = text.strip()
 
     if not re.search(r'\b(avg|min|max)\s*\(', stripped, flags=re.IGNORECASE):
-        return original  # leave unchanged
+        return original
 
     has_equals = stripped.startswith("=")
     body = stripped[1:] if has_equals else stripped
@@ -200,25 +206,117 @@ def convert_formula(text: str):
     return "=" + converted if has_equals else converted
 
 
-# ----------------------------
+# =========================================================
+# EXCEL HELPERS
+# =========================================================
+def excel_col_to_index(col_letter: str) -> int:
+    col_letter = col_letter.strip().upper()
+    result = 0
+    for ch in col_letter:
+        if not ("A" <= ch <= "Z"):
+            raise ValueError(f"Invalid column letter: {col_letter}")
+        result = result * 26 + (ord(ch) - ord("A") + 1)
+    return result
+
+
+def get_col_index(ws, col_ref):
+    if isinstance(col_ref, str):
+        ref = col_ref.strip()
+
+        # First check header name
+        header_map = {}
+        for cell in ws[1]:
+            if cell.value is not None:
+                header_map[str(cell.value).strip().lower()] = cell.column
+
+        if ref.lower() in header_map:
+            return header_map[ref.lower()]
+
+        # Then check if Excel column letter
+        if re.fullmatch(r"[A-Za-z]+", ref):
+            return excel_col_to_index(ref)
+
+    raise ValueError(f"Could not resolve column reference '{col_ref}' in sheet '{ws.title}'")
+
+
+def copy_pi_tags(input_ws, output_ws):
+    short_col_idx = get_col_index(input_ws, PI_SHORT_NAME_COL)
+    pi_name_col_idx = get_col_index(input_ws, PI_NAME_COL)
+
+    output_ws.append(["tag_short_name", "tag_pi_name", "tag_type"])
+
+    for row in range(START_ROW, input_ws.max_row + 1):
+        short_name = input_ws.cell(row=row, column=short_col_idx).value
+        pi_name = input_ws.cell(row=row, column=pi_name_col_idx).value
+
+        if short_name is None and pi_name is None:
+            continue
+
+        output_ws.append([short_name, pi_name, "PI"])
+
+
+def copy_inferred_tags(input_ws, output_ws):
+    short_col_idx = get_col_index(input_ws, INFERRED_SHORT_NAME_COL)
+    formula_col_idx = get_col_index(input_ws, INFERRED_FORMULA_COL)
+
+    output_ws.append(["tag_short_name", "formula", "tag_type"])
+
+    for row in range(START_ROW, input_ws.max_row + 1):
+        short_name = input_ws.cell(row=row, column=short_col_idx).value
+        formula = input_ws.cell(row=row, column=formula_col_idx).value
+
+        if short_name is None and formula is None:
+            continue
+
+        updated_formula = convert_formula(formula) if isinstance(formula, str) else formula
+        output_ws.append([short_name, updated_formula, "INFERRED"])
+
+
+def auto_adjust_width(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = col[0].column_letter
+        for cell in col:
+            cell_val = "" if cell.value is None else str(cell.value)
+            max_len = max(max_len, len(cell_val))
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
+
+
+# =========================================================
 # MAIN
-# ----------------------------
-wb = load_workbook(INPUT_FILE)
-ws = wb[SHEET_NAME] if SHEET_NAME else wb[wb.sheetnames[0]]
+# =========================================================
+def main():
+    in_wb = load_workbook(INPUT_FILE, data_only=False)
 
-changed_rows = []
+    if INPUT_PI_SHEET not in in_wb.sheetnames:
+        raise ValueError(f"Sheet '{INPUT_PI_SHEET}' not found in input file.")
+    if INPUT_INFERRED_SHEET not in in_wb.sheetnames:
+        raise ValueError(f"Sheet '{INPUT_INFERRED_SHEET}' not found in input file.")
 
-for row in range(1, ws.max_row + 1):
-    cell = ws[f"E{row}"]
-    old_value = cell.value
+    pi_ws_in = in_wb[INPUT_PI_SHEET]
+    inferred_ws_in = in_wb[INPUT_INFERRED_SHEET]
 
-    if isinstance(old_value, str):
-        new_value = convert_formula(old_value)
-        if new_value != old_value:
-            cell.value = new_value
-            changed_rows.append(row)
+    out_wb = Workbook()
 
-wb.save(OUTPUT_FILE)
+    # Remove default sheet
+    default_ws = out_wb.active
+    out_wb.remove(default_ws)
 
-print(f"Done. Output saved as: {OUTPUT_FILE}")
-print(f"Rows changed in column E: {changed_rows}")
+    # Create output sheets
+    pi_ws_out = out_wb.create_sheet(OUTPUT_PI_SHEET)
+    inferred_ws_out = out_wb.create_sheet(OUTPUT_INFERRED_SHEET)
+
+    # Copy required data
+    copy_pi_tags(pi_ws_in, pi_ws_out)
+    copy_inferred_tags(inferred_ws_in, inferred_ws_out)
+
+    # Optional width adjustment
+    auto_adjust_width(pi_ws_out)
+    auto_adjust_width(inferred_ws_out)
+
+    out_wb.save(OUTPUT_FILE)
+    print(f"Done. Output saved as: {OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
