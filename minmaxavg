@@ -320,3 +320,54 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def build_avg(args):
+    if not args:
+        return "0"
+
+    sum_vals = " + ".join([f"if(missing({a}), 0, {a})" for a in args])
+    sum_flags = " + ".join([f"if(missing({a}), 0, 1)" for a in args])
+
+    return (
+        f"if(({sum_flags}) == 0, 0, "
+        f"(({sum_vals}) / ({sum_flags})))"
+    )
+
+
+def build_max(args):
+    if not args:
+        return "0"
+
+    flags = " + ".join([f"if(missing({a}), 0, 1)" for a in args])
+    protected_args = ", ".join([f"if(missing({a}), 0, {a})" for a in args])
+
+    return (
+        f"if(({flags}) == 0, 0, "
+        f"max({protected_args}))"
+    )
+
+
+def build_min(args):
+    if not args:
+        return "0"
+
+    flags = " + ".join([f"if(missing({a}), 0, 1)" for a in args])
+    protected_args = ", ".join([f"if(missing({a}), {MIN_SENTINEL}, {a})" for a in args])
+
+    return (
+        f"if(({flags}) == 0, 0, "
+        f"min({protected_args}))"
+    )
