@@ -1,143 +1,81 @@
-from __future__ import annotations
-
 import re
-from pathlib import Path
-from typing import Iterable
-
 from openpyxl import load_workbook
 
+# ----------------------------
+# CONFIG
+# ----------------------------
+INPUT_FILE = "input.xlsx"
+OUTPUT_FILE = "output_converted.xlsx"
+SHEET_NAME = None   # None = first sheet, or put sheet name like "Sheet1"
 
-# Functions to transform
-TARGET_FUNCS = {"MAX", "MIN", "AVERAGE"}
-
-# Missing values will be replaced with this
-DEFAULT_MISSING_VALUE = "0"
-
-
-def is_numeric_literal(text: str) -> bool:
-    """Return True if text looks like a numeric literal."""
-    return bool(
-        re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+-]?\d+)?", text.strip())
-    )
+# For MIN, missing values are replaced by a very large number.
+# If your real values can be larger than this, increase it.
+MIN_SENTINEL = "1e99"
 
 
-def should_wrap_argument(arg: str) -> bool:
-    """
-    Decide whether an argument should be wrapped with IF(IS_MISSING(...), default, ...).
-    Constants like numbers, strings, TRUE/FALSE are left unchanged.
-    """
-    s = arg.strip()
-    if not s:
-        return False
-    if s.startswith('"') and s.endswith('"'):
-        return False
-    if is_numeric_literal(s):
-        return False
-    if s.upper() in {"TRUE", "FALSE"}:
-        return False
-    return True
-
-
-def already_wrapped(arg: str) -> bool:
-    """Avoid wrapping something that already starts with IF(IS_MISSING(...))."""
-    s = arg.strip()
-    return bool(re.match(r"(?is)^IF\s*\(\s*IS_MISSING\s*\(", s))
-
-
-def split_top_level_args(text: str) -> list[str]:
-    """
-    Split function arguments by top-level commas only.
-    Handles nested functions, strings, sheet names, arrays, and structured refs.
-    """
+# ----------------------------
+# HELPERS
+# ----------------------------
+def split_top_level_args(s: str):
+    """Split function arguments by comma, but only at top level."""
     args = []
-    start = 0
-    paren = brace = bracket = 0
-    in_double_quote = False
-    in_single_quote = False
+    buf = []
+    depth = 0
+    in_string = False
+    string_char = ""
+
     i = 0
+    while i < len(s):
+        ch = s[i]
 
-    while i < len(text):
-        ch = text[i]
-
-        if in_double_quote:
-            if ch == '"':
-                if i + 1 < len(text) and text[i + 1] == '"':  # Escaped ""
-                    i += 2
-                    continue
-                in_double_quote = False
+        if in_string:
+            buf.append(ch)
+            if ch == string_char:
+                in_string = False
             i += 1
             continue
 
-        if in_single_quote:
-            if ch == "'":
-                if i + 1 < len(text) and text[i + 1] == "'":  # Escaped ''
-                    i += 2
-                    continue
-                in_single_quote = False
-            i += 1
-            continue
-
-        if ch == '"':
-            in_double_quote = True
-        elif ch == "'":
-            in_single_quote = True
+        if ch in ("'", '"'):
+            in_string = True
+            string_char = ch
+            buf.append(ch)
         elif ch == "(":
-            paren += 1
+            depth += 1
+            buf.append(ch)
         elif ch == ")":
-            paren -= 1
-        elif ch == "{":
-            brace += 1
-        elif ch == "}":
-            brace -= 1
-        elif ch == "[":
-            bracket += 1
-        elif ch == "]":
-            bracket -= 1
-        elif ch == "," and paren == 0 and brace == 0 and bracket == 0:
-            args.append(text[start:i])
-            start = i + 1
+            depth -= 1
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            args.append("".join(buf).strip())
+            buf = []
+        else:
+            buf.append(ch)
 
         i += 1
 
-    args.append(text[start:])
+    if buf:
+        args.append("".join(buf).strip())
+
     return args
 
 
-def find_matching_paren(text: str, open_paren_idx: int) -> int:
-    """Find the matching ')' for the '(' at open_paren_idx."""
-    if text[open_paren_idx] != "(":
-        raise ValueError("Expected '(' at open_paren_idx")
+def find_matching_paren(text: str, open_pos: int):
+    """Find matching ')' for '(' at open_pos."""
+    depth = 0
+    in_string = False
+    string_char = ""
 
-    depth = 1
-    in_double_quote = False
-    in_single_quote = False
-    i = open_paren_idx + 1
-
-    while i < len(text):
+    for i in range(open_pos, len(text)):
         ch = text[i]
 
-        if in_double_quote:
-            if ch == '"':
-                if i + 1 < len(text) and text[i + 1] == '"':
-                    i += 2
-                    continue
-                in_double_quote = False
-            i += 1
+        if in_string:
+            if ch == string_char:
+                in_string = False
             continue
 
-        if in_single_quote:
-            if ch == "'":
-                if i + 1 < len(text) and text[i + 1] == "'":
-                    i += 2
-                    continue
-                in_single_quote = False
-            i += 1
-            continue
-
-        if ch == '"':
-            in_double_quote = True
-        elif ch == "'":
-            in_single_quote = True
+        if ch in ("'", '"'):
+            in_string = True
+            string_char = ch
         elif ch == "(":
             depth += 1
         elif ch == ")":
@@ -145,197 +83,142 @@ def find_matching_paren(text: str, open_paren_idx: int) -> int:
             if depth == 0:
                 return i
 
-        i += 1
-
-    raise ValueError(f"Unmatched '(' in formula text: {text}")
+    return -1
 
 
-def looks_like_exact_function_call(text: str, names: set[str] | None = None) -> bool:
+def build_avg(args):
+    if not args:
+        return "0"
+
+    sum_vals = " + ".join([f"if(is_missing({a}), 0, {a})" for a in args])
+    sum_flags = " + ".join([f"if(is_missing({a}), 0, 1)" for a in args])
+
+    return (
+        f"if(({sum_flags}) = 0, 0, "
+        f"(({sum_vals}) / ({sum_flags})))"
+    )
+
+
+def build_max(args):
+    if not args:
+        return "0"
+
+    flags = " + ".join([f"if(is_missing({a}), 0, 1)" for a in args])
+    protected_args = ", ".join([f"if(is_missing({a}), 0, {a})" for a in args])
+
+    return (
+        f"if(({flags}) = 0, 0, "
+        f"max({protected_args}))"
+    )
+
+
+def build_min(args):
+    if not args:
+        return "0"
+
+    flags = " + ".join([f"if(is_missing({a}), 0, 1)" for a in args])
+    protected_args = ", ".join([f"if(is_missing({a}), {MIN_SENTINEL}, {a})" for a in args])
+
+    return (
+        f"if(({flags}) = 0, 0, "
+        f"min({protected_args}))"
+    )
+
+
+def transform_expression(expr: str):
     """
-    Return True if text is exactly one function call, e.g. MIN(A,B)
-    and not something like MIN(A,B)+1
-    """
-    s = text.strip()
-    match = re.match(r"(?is)^([A-Z_][A-Z0-9_\.]*)\s*\(", s)
-    if not match:
-        return False
-
-    func_name = match.group(1).upper()
-    if names and func_name not in names:
-        return False
-
-    open_idx = s.find("(")
-    try:
-        close_idx = find_matching_paren(s, open_idx)
-    except ValueError:
-        return False
-
-    return close_idx == len(s) - 1
-
-
-def wrap_argument(arg: str, default_value: str) -> str:
-    """
-    Transform nested target functions inside the argument, then wrap the argument itself
-    if needed.
-    """
-    transformed = transform_expression(arg, default_value).strip()
-
-    if not should_wrap_argument(transformed):
-        return transformed
-
-    if already_wrapped(transformed):
-        return transformed
-
-    # If the argument is itself exactly MAX/MIN/AVERAGE(...), do not wrap again.
-    # Its internal arguments are already handled recursively.
-    if looks_like_exact_function_call(transformed, TARGET_FUNCS):
-        return transformed
-
-    return f"IF(IS_MISSING({transformed}), {default_value}, {transformed})"
-
-
-def transform_function_call(func_name: str, inner_text: str, default_value: str) -> str:
-    """
-    Transform a function call body.
-    For MAX/MIN/AVERAGE, wrap each direct argument.
-    For all other functions, just recurse inside.
-    """
-    if func_name.upper() in TARGET_FUNCS:
-        args = split_top_level_args(inner_text)
-        transformed_args = [wrap_argument(arg, default_value) for arg in args]
-        return ", ".join(transformed_args)
-
-    return transform_expression(inner_text, default_value)
-
-
-def transform_expression(text: str, default_value: str = DEFAULT_MISSING_VALUE) -> str:
-    """
-    Recursively transform formula text.
+    Recursively transform avg(...), min(...), max(...)
+    even when they are inside bigger formulas.
     """
     result = []
     i = 0
 
-    while i < len(text):
-        ch = text[i]
+    while i < len(expr):
+        ch = expr[i]
 
-        # Excel string literal: "text"
-        if ch == '"':
+        # Detect function name
+        if ch.isalpha() or ch == "_":
             start = i
-            i += 1
-            while i < len(text):
-                if text[i] == '"':
-                    if i + 1 < len(text) and text[i + 1] == '"':
-                        i += 2
-                        continue
-                    i += 1
+            while i < len(expr) and (expr[i].isalnum() or expr[i] == "_"):
+                i += 1
+            func_name = expr[start:i]
+
+            # Skip spaces after function name
+            j = i
+            while j < len(expr) and expr[j].isspace():
+                j += 1
+
+            # Function call?
+            if j < len(expr) and expr[j] == "(":
+                end = find_matching_paren(expr, j)
+                if end == -1:
+                    # Broken formula, keep as is
+                    result.append(expr[start:])
                     break
-                i += 1
-            result.append(text[start:i])
-            continue
 
-        # Quoted sheet/workbook name: 'My Sheet'!A1
-        if ch == "'":
-            start = i
-            i += 1
-            while i < len(text):
-                if text[i] == "'":
-                    if i + 1 < len(text) and text[i + 1] == "'":
-                        i += 2
-                        continue
-                    i += 1
-                    break
-                i += 1
-            result.append(text[start:i])
-            continue
+                inner = expr[j + 1:end]
+                args = split_top_level_args(inner)
+                transformed_args = [transform_expression(a) for a in args]
 
-        # Function / identifier
-        if ch.isalpha() or ch in {"_", "."}:
-            start = i
-            i += 1
-            while i < len(text) and (text[i].isalnum() or text[i] in {"_", "."}):
-                i += 1
+                fname = func_name.lower()
 
-            token = text[start:i]
+                if fname == "avg":
+                    replacement = build_avg(transformed_args)
+                elif fname == "max":
+                    replacement = build_max(transformed_args)
+                elif fname == "min":
+                    replacement = build_min(transformed_args)
+                else:
+                    replacement = f"{func_name}(" + ", ".join(transformed_args) + ")"
 
-            # Preserve whitespace between function name and '(' if any
-            ws_start = i
-            while i < len(text) and text[i].isspace():
-                i += 1
-
-            if i < len(text) and text[i] == "(":
-                end = find_matching_paren(text, i)
-                inner = text[i + 1:end]
-                new_inner = transform_function_call(token, inner, default_value)
-
-                result.append(token)
-                result.append(text[ws_start:i])
-                result.append("(")
-                result.append(new_inner)
-                result.append(")")
-
+                result.append(replacement)
                 i = end + 1
             else:
-                result.append(text[start:i])
-
-            continue
-
-        result.append(ch)
-        i += 1
+                result.append(func_name)
+        else:
+            result.append(ch)
+            i += 1
 
     return "".join(result)
 
 
-def transform_formula(formula: str, default_value: str = DEFAULT_MISSING_VALUE) -> str:
-    """Transform a full Excel formula string."""
-    if not isinstance(formula, str) or not formula.startswith("="):
-        return formula
-    return "=" + transform_expression(formula[1:], default_value)
+def convert_formula(text: str):
+    """Preserve leading '=' if present."""
+    if not isinstance(text, str):
+        return text
+
+    original = text
+    stripped = text.strip()
+
+    if not re.search(r'\b(avg|min|max)\s*\(', stripped, flags=re.IGNORECASE):
+        return original  # leave unchanged
+
+    has_equals = stripped.startswith("=")
+    body = stripped[1:] if has_equals else stripped
+
+    converted = transform_expression(body)
+    return "=" + converted if has_equals else converted
 
 
-def process_workbook(
-    input_file: str | Path,
-    output_file: str | Path,
-    sheets: Iterable[str] | None = None,
-    default_value: str = DEFAULT_MISSING_VALUE,
-) -> None:
-    """
-    Open an Excel workbook, update formulas in-place, and save to a new file.
-    """
-    input_file = Path(input_file)
-    output_file = Path(output_file)
+# ----------------------------
+# MAIN
+# ----------------------------
+wb = load_workbook(INPUT_FILE)
+ws = wb[SHEET_NAME] if SHEET_NAME else wb[wb.sheetnames[0]]
 
-    wb = load_workbook(input_file)
+changed_rows = []
 
-    target_sheets = wb.sheetnames if sheets is None else list(sheets)
+for row in range(1, ws.max_row + 1):
+    cell = ws[f"E{row}"]
+    old_value = cell.value
 
-    changed_cells = 0
+    if isinstance(old_value, str):
+        new_value = convert_formula(old_value)
+        if new_value != old_value:
+            cell.value = new_value
+            changed_rows.append(row)
 
-    for sheet_name in target_sheets:
-        ws = wb[sheet_name]
+wb.save(OUTPUT_FILE)
 
-        for row in ws.iter_rows():
-            for cell in row:
-                if isinstance(cell.value, str) and cell.value.startswith("="):
-                    old_formula = cell.value
-                    new_formula = transform_formula(old_formula, default_value)
-
-                    if new_formula != old_formula:
-                        cell.value = new_formula
-                        changed_cells += 1
-
-    wb.save(output_file)
-    print(f"Done. Updated {changed_cells} formula cell(s).")
-    print(f"Saved to: {output_file}")
-
-
-if __name__ == "__main__":
-    # Example:
-    # process_workbook("input.xlsx", "output.xlsx")
-
-    # Quick formula test
-    sample = "=MAX(tag_A, tag_B, tag_C)"
-    print("Original :", sample)
-    print("Updated  :", transform_formula(sample))
-
-    # Uncomment this line to process a real workbook
-    # process_workbook("input.xlsx", "output.xlsx")
+print(f"Done. Output saved as: {OUTPUT_FILE}")
+print(f"Rows changed in column E: {changed_rows}")
