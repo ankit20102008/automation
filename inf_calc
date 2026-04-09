@@ -511,3 +511,566 @@ if __name__ == "__main__":
     process_workbook(input_file, output_file, args.sheet)
     print(f"Input workbook : {input_file}")
     print(f"Output workbook: {output_file}")
+
+
+
+
+
+
+
+
+import argparse
+import re
+from openpyxl import load_workbook
+
+# =========================
+# USER SETTINGS
+# =========================
+INPUT_FILE = "template.xlsx"
+OUTPUT_FILE = "template_rapidminer_all_sheets.xlsx"
+
+# Put a list like ["SheetA", "SheetB"] if you want only selected sheets.
+# Keep None to process all eligible formula sheets.
+SHEETS_TO_PROCESS = None
+
+NO_OUTPUT_TOKEN = "MISSING NUMERIC"
+INPUT_SUFFIX = "_RM_input"
+
+
+# =========================
+# HELPERS
+# =========================
+def collapse_outer_parens(expr: str) -> str:
+    expr = expr.strip()
+    while expr.startswith("(") and expr.endswith(")"):
+        depth = 0
+        in_quote = False
+        ok = True
+        for i, ch in enumerate(expr):
+            if ch == "'" and (i == 0 or expr[i - 1] != "\\"):
+                in_quote = not in_quote
+            elif not in_quote:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i != len(expr) - 1:
+                        ok = False
+                        break
+        if ok and depth == 0:
+            expr = expr[1:-1].strip()
+        else:
+            break
+    return expr
+
+
+def find_matching_paren(text: str, open_idx: int) -> int:
+    depth = 0
+    in_quote = False
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if ch == "'" and (i == 0 or text[i - 1] != "\\"):
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
+
+
+def split_top_level_args(text: str):
+    if text.strip() == "":
+        return []
+
+    args = []
+    start = 0
+    depth = 0
+    in_quote = False
+
+    for i, ch in enumerate(text):
+        if ch == "'" and (i == 0 or text[i - 1] != "\\"):
+            in_quote = not in_quote
+        elif not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                args.append(text[start:i].strip())
+                start = i + 1
+
+    args.append(text[start:].strip())
+    return args
+
+
+def find_top_level_keyword(text: str, keyword: str) -> int:
+    depth = 0
+    in_quote = False
+    kw = keyword.lower()
+
+    i = 0
+    while i <= len(text) - len(keyword):
+        ch = text[i]
+
+        if ch == "'" and (i == 0 or text[i - 1] != "\\"):
+            in_quote = not in_quote
+            i += 1
+            continue
+
+        if not in_quote:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+
+            if depth == 0 and text[i:i + len(keyword)].lower() == kw:
+                prev = text[i - 1] if i > 0 else " "
+                nxt = text[i + len(keyword)] if i + len(keyword) < len(text) else " "
+                if not (prev.isalnum() or prev == "_") and not (nxt.isalnum() or nxt == "_"):
+                    return i
+        i += 1
+
+    return -1
+
+
+def parse_if(expr: str):
+    expr = expr.strip()
+    if expr[:2].lower() != "if":
+        return None
+
+    rest = expr[2:].lstrip()
+    then_idx = find_top_level_keyword(rest, "Then")
+    if then_idx == -1:
+        return None
+
+    condition = rest[:then_idx].strip()
+    rest_after_then = rest[then_idx + 4:].lstrip()
+
+    else_idx = find_top_level_keyword(rest_after_then, "Else")
+    if else_idx == -1:
+        return None
+
+    true_part = rest_after_then[:else_idx].strip()
+    false_part = rest_after_then[else_idx + 4:].strip()
+
+    return condition, true_part, false_part
+
+
+def sanitize_name(name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_]+", "_", str(name))
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    return safe
+
+
+def make_input_alias(original_name: str) -> str:
+    original_name = str(original_name)
+
+    if original_name.endswith("|Lo"):
+        return "inp_" + sanitize_name(original_name[:-3]) + "_Lo"
+    if original_name.endswith("|Hi"):
+        return "inp_" + sanitize_name(original_name[:-3]) + "_Hi"
+    if original_name.endswith("|DF"):
+        return "inp_" + sanitize_name(original_name[:-3]) + "_DF"
+    if original_name.endswith("|DS"):
+        return "inp_" + sanitize_name(original_name[:-3]) + "_DS"
+    if original_name.endswith("|Prev"):
+        return "inp_" + sanitize_name(original_name[:-5]) + "_Prev"
+
+    return "inp_" + sanitize_name(original_name)
+
+
+def transform_composite(expr: str, input_map: dict) -> str:
+    out = []
+    i = 0
+
+    while i < len(expr):
+        ch = expr[i]
+
+        # Quoted reference -> input attribute
+        if ch == "'":
+            j = i + 1
+            while j < len(expr):
+                if expr[j] == "'" and expr[j - 1] != "\\":
+                    break
+                j += 1
+
+            inner = expr[i + 1:j]
+            if inner not in input_map:
+                input_map[inner] = make_input_alias(inner)
+
+            out.append(f"[{input_map[inner]}]")
+            i = j + 1
+            continue
+
+        # Word / variable / function
+        if ch.isalpha() or ch == "_":
+            j = i + 1
+            while j < len(expr) and (expr[j].isalnum() or expr[j] == "_"):
+                j += 1
+
+            word = expr[i:j]
+
+            k = j
+            while k < len(expr) and expr[k].isspace():
+                k += 1
+
+            # Function call
+            if k < len(expr) and expr[k] == "(":
+                end = find_matching_paren(expr, k)
+                if end != -1:
+                    func_text = expr[i:end + 1]
+                    out.append(transform_expression(func_text, input_map))
+                    i = end + 1
+                    continue
+
+            # Internal variable with leading v
+            if word.startswith("v") and len(word) > 1 and (word[1].isalpha() or word[1] == "_"):
+                out.append(f"[{word[1:]}]")
+            else:
+                out.append(word)
+
+            i = j
+            continue
+
+        out.append(ch)
+        i += 1
+
+    text = "".join(out)
+
+    text = re.sub(r"(?i)\bAND\b", "and", text)
+    text = re.sub(r"(?i)\bOR\b", "or", text)
+    text = re.sub(r"(?i)\bNOT\b", "not", text)
+
+    text = text.replace("<>", "!=")
+    text = re.sub(r"(?<![<>=!])=(?!=)", "==", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def transform_expression(expr: str, input_map: dict) -> str:
+    expr = collapse_outer_parens(str(expr).strip())
+
+    parsed_if = parse_if(expr)
+    if parsed_if:
+        condition, true_part, false_part = parsed_if
+        return (
+            f"if({transform_expression(condition, input_map)}, "
+            f"{transform_expression(true_part, input_map)}, "
+            f"{transform_expression(false_part, input_map)})"
+        )
+
+    func_match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", expr, flags=re.S)
+    if func_match:
+        fname = func_match.group(1)
+        open_idx = expr.find("(")
+
+        if find_matching_paren(expr, open_idx) == len(expr) - 1:
+            inner = expr[open_idx + 1:-1]
+            args = split_top_level_args(inner)
+            fname_l = fname.lower()
+
+            if fname_l == "median" and len(args) == 3:
+                lo = transform_expression(args[0], input_map)
+                val = transform_expression(args[1], input_map)
+                hi = transform_expression(args[2], input_map)
+                return f"min(max({val}, {lo}), {hi})"
+
+            if fname_l == "badval" and len(args) == 1:
+                return f"missing({transform_expression(args[0], input_map)})"
+
+            if fname_l == "nooutput" and len(args) == 0:
+                return NO_OUTPUT_TOKEN
+
+            if fname_l == "prevval" and len(args) >= 1:
+                first_arg = args[0].strip()
+                m = re.fullmatch(r"'([^']*)'", first_arg)
+                if m:
+                    prev_name = m.group(1) + "|Prev"
+                    if prev_name not in input_map:
+                        input_map[prev_name] = make_input_alias(prev_name)
+                    return f"[{input_map[prev_name]}]"
+
+                fallback_name = "PrevValue"
+                if fallback_name not in input_map:
+                    input_map[fallback_name] = make_input_alias(fallback_name)
+                return f"[{input_map[fallback_name]}]"
+
+            transformed_args = [transform_expression(arg, input_map) for arg in args]
+            generic_name = fname.lower() if fname.lower() in {
+                "min", "max", "abs", "sqrt", "exp", "ln", "log",
+                "sin", "cos", "tan", "round", "floor", "ceil", "pow"
+            } else fname
+
+            return f"{generic_name}(" + ", ".join(transformed_args) + ")"
+
+    return transform_composite(expr, input_map)
+
+
+# =========================
+# WORKBOOK HELPERS
+# =========================
+def detect_formula_columns(ws):
+    headers = {
+        str(ws.cell(1, c).value).strip().lower(): c
+        for c in range(1, ws.max_column + 1)
+        if ws.cell(1, c).value is not None
+    }
+
+    var_col = None
+    formula_col = None
+
+    for key, col in headers.items():
+        if key in {"variable_names", "variable names", "variable_name", "variablename"}:
+            var_col = col
+        if key in {"formulas", "formula", "analysis rule config string", "analysis_rule_config_string"}:
+            formula_col = col
+
+    if var_col is None:
+        for key, col in headers.items():
+            if "variable" in key and "mapping" not in key:
+                var_col = col
+                break
+
+    if formula_col is None:
+        for key, col in headers.items():
+            if "formula" in key or "config string" in key:
+                formula_col = col
+                break
+
+    return var_col, formula_col
+
+
+def get_or_create_output_columns(ws):
+    headers = {
+        str(ws.cell(1, c).value).strip(): c
+        for c in range(1, ws.max_column + 1)
+        if ws.cell(1, c).value is not None
+    }
+
+    rm_var_col = headers.get("RapidMiner_Variable_Name")
+    rm_formula_col = headers.get("RapidMiner_Formula")
+
+    next_col = ws.max_column + 1
+
+    if rm_var_col is None:
+        rm_var_col = next_col
+        ws.cell(1, rm_var_col).value = "RapidMiner_Variable_Name"
+        next_col += 1
+
+    if rm_formula_col is None:
+        rm_formula_col = next_col
+        ws.cell(1, rm_formula_col).value = "RapidMiner_Formula"
+
+    return rm_var_col, rm_formula_col
+
+
+def extract_existing_input_values(input_ws):
+    if input_ws is None:
+        return {}
+
+    headers = {
+        str(input_ws.cell(1, c).value).strip(): c
+        for c in range(1, input_ws.max_column + 1)
+        if input_ws.cell(1, c).value is not None
+    }
+
+    original_col = headers.get("Original_Input_Name")
+    value_col = headers.get("Value")
+
+    values = {}
+    if original_col and value_col:
+        for r in range(2, input_ws.max_row + 1):
+            key = input_ws.cell(r, original_col).value
+            if key is not None:
+                values[str(key)] = input_ws.cell(r, value_col).value
+
+    return values
+
+
+def make_unique_sheet_name(base_name: str, existing_names) -> str:
+    name = base_name
+    counter = 2
+
+    while name in existing_names:
+        suffix = f"_{counter}"
+        max_base_len = 31 - len(suffix)
+        name = base_name[:max_base_len] + suffix
+        counter += 1
+
+    return name
+
+
+def build_input_sheet_name(source_sheet_name: str, existing_names) -> str:
+    # Excel sheet name limit is 31 chars.
+    clean_name = str(source_sheet_name).rstrip()
+    max_base_len = 31 - len(INPUT_SUFFIX)
+    base_name = clean_name[:max_base_len] + INPUT_SUFFIX
+    return make_unique_sheet_name(base_name, set(existing_names))
+
+
+def create_side_by_side_input_sheet(wb, source_ws, inputs):
+    source_index = wb.sheetnames.index(source_ws.title)
+
+    existing_values = {}
+    sheet_to_delete = None
+
+    # If the next tab is already an RM input sheet, reuse its values and replace it.
+    if source_index + 1 < len(wb.sheetnames):
+        next_name = wb.sheetnames[source_index + 1]
+        if next_name.endswith(INPUT_SUFFIX):
+            existing_values = extract_existing_input_values(wb[next_name])
+            sheet_to_delete = next_name
+
+    existing_names_for_new = list(wb.sheetnames)
+    if sheet_to_delete:
+        existing_names_for_new = [n for n in existing_names_for_new if n != sheet_to_delete]
+
+    new_input_sheet_name = build_input_sheet_name(source_ws.title, existing_names_for_new)
+
+    # If same target name exists elsewhere, preserve values and replace it.
+    if new_input_sheet_name in wb.sheetnames and new_input_sheet_name != sheet_to_delete:
+        existing_values = extract_existing_input_values(wb[new_input_sheet_name]) or existing_values
+        del wb[new_input_sheet_name]
+
+    if sheet_to_delete and sheet_to_delete in wb.sheetnames:
+        del wb[sheet_to_delete]
+        source_index = wb.sheetnames.index(source_ws.title)
+
+    input_ws = wb.create_sheet(title=new_input_sheet_name, index=source_index + 1)
+    input_ws.append(["Original_Input_Name", "Value", "RapidMiner_Input_Name"])
+
+    for original_name, rm_name in inputs:
+        input_ws.append([original_name, existing_values.get(original_name), rm_name])
+
+    return input_ws.title
+
+
+def process_formula_sheet(wb, ws):
+    var_col, formula_col = detect_formula_columns(ws)
+    if not var_col or not formula_col:
+        return None
+
+    rm_var_col, rm_formula_col = get_or_create_output_columns(ws)
+    input_map = {}
+
+    for r in range(2, ws.max_row + 1):
+        var_value = ws.cell(r, var_col).value
+        formula_value = ws.cell(r, formula_col).value
+
+        if var_value is not None:
+            var_name = str(var_value).strip()
+            ws.cell(r, rm_var_col).value = var_name[1:] if var_name.startswith("v") else var_name
+
+        if formula_value is None:
+            continue
+
+        if isinstance(formula_value, (int, float)):
+            ws.cell(r, rm_formula_col).value = formula_value
+        else:
+            formula_text = str(formula_value).strip()
+            if formula_text == "":
+                ws.cell(r, rm_formula_col).value = ""
+            else:
+                ws.cell(r, rm_formula_col).value = transform_expression(formula_text, input_map)
+
+    sorted_inputs = sorted(input_map.items(), key=lambda x: x[0].lower())
+    rm_input_sheet_name = create_side_by_side_input_sheet(wb, ws, sorted_inputs)
+
+    return {
+        "sheet_name": ws.title,
+        "rm_input_sheet_name": rm_input_sheet_name,
+        "input_count": len(sorted_inputs),
+        "row_count": ws.max_row - 1,
+    }
+
+
+def should_process_sheet(ws) -> bool:
+    if ws.title.endswith(INPUT_SUFFIX):
+        return False
+    var_col, formula_col = detect_formula_columns(ws)
+    return bool(var_col and formula_col)
+
+
+def process_workbook(input_path: str, output_path: str, requested_sheets=None):
+    wb = load_workbook(input_path)
+
+    sheet_names = list(wb.sheetnames)
+    results = []
+    skipped = []
+
+    for sheet_name in sheet_names:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+
+        if requested_sheets is not None and sheet_name not in requested_sheets:
+            skipped.append((sheet_name, "not in SHEETS_TO_PROCESS"))
+            continue
+
+        if not should_process_sheet(ws):
+            skipped.append((sheet_name, "no formula/variable columns detected"))
+            continue
+
+        result = process_formula_sheet(wb, ws)
+        if result:
+            results.append(result)
+        else:
+            skipped.append((sheet_name, "sheet skipped"))
+
+    wb.save(output_path)
+
+    print(f"Input workbook : {input_path}")
+    print(f"Output workbook: {output_path}")
+    print("-" * 60)
+
+    if results:
+        print("Processed sheets:")
+        for item in results:
+            print(
+                f"  - {item['sheet_name']}  ->  {item['rm_input_sheet_name']} "
+                f"(rows={item['row_count']}, inputs={item['input_count']})"
+            )
+    else:
+        print("No eligible formula sheets found.")
+
+    if skipped:
+        print("-" * 60)
+        print("Skipped sheets:")
+        for name, reason in skipped:
+            print(f"  - {name}: {reason}")
+
+
+# =========================
+# ENTRY POINT
+# =========================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert PI/Excel-style formulas to RapidMiner-ready formulas for all eligible sheets."
+    )
+    parser.add_argument("--input", help="Input Excel file path. If omitted, INPUT_FILE is used.")
+    parser.add_argument("--output", help="Output Excel file path. If omitted, OUTPUT_FILE is used.")
+    parser.add_argument(
+        "--sheet",
+        action="append",
+        help="Optional sheet name to process. Can be passed multiple times."
+    )
+
+    # parse_known_args avoids Jupyter / Spyder extra argument errors
+    args, _unknown = parser.parse_known_args()
+
+    input_file = args.input if args.input else INPUT_FILE
+    output_file = args.output if args.output else OUTPUT_FILE
+
+    if args.sheet:
+        sheets_to_process = args.sheet
+    else:
+        sheets_to_process = SHEETS_TO_PROCESS
+
+    process_workbook(input_file, output_file, sheets_to_process)
