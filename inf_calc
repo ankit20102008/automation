@@ -1,0 +1,513 @@
+import re
+import argparse
+from pathlib import Path
+import openpyxl
+
+# ========= USER SETTINGS =========
+INPUT_FILE = "template.xlsx"
+OUTPUT_FILE = "template_rapidminer_pipe_safe_vless.xlsx"
+SHEET_NAME = " sabic.com SABICFS citrix_upm 3"
+NO_OUTPUT_TOKEN = "MISSING NUMERIC"
+# ================================
+
+
+def sanitize_name(text: str) -> str:
+    text = str(text).strip()
+    text = text.replace("|", "_")
+    text = re.sub(r"[^A-Za-z0-9_]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("_")
+    return text
+
+
+def strip_v_prefix(name: str) -> str:
+    name = str(name).strip()
+    return name[1:] if name.startswith("v") else name
+
+
+def rapidminer_input_name(tag_name: str) -> str:
+    raw = str(tag_name).strip()
+
+    m = re.match(r"^(.*)\|(Lo|Hi|DF|DS)$", raw, flags=re.I)
+    if m:
+        base = sanitize_name(m.group(1))
+        suffix = m.group(2)
+        suffix_map = {"lo": "Lo", "hi": "Hi", "df": "DF", "ds": "DS"}
+        suffix = suffix_map[suffix.lower()]
+        return f"inp_{base}_{suffix}"
+
+    return f"inp_{sanitize_name(raw)}"
+
+
+def escape_attr(name: str) -> str:
+    return str(name).replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def extract_quoted_refs(formula: str):
+    if formula is None:
+        return []
+    refs = []
+    for m in re.finditer(r"'([^']*)'", str(formula)):
+        content = m.group(1)
+        if content != "*":
+            refs.append(content)
+    return refs
+
+
+def replace_quoted_refs_with_rm_inputs(s: str):
+    def repl(m):
+        content = m.group(1)
+        if content == "*":
+            return "'*'"
+        return f"[{escape_attr(rapidminer_input_name(content))}]"
+    return re.sub(r"'([^']*)'", repl, s)
+
+
+def paren_depth_at(s: str, pos: int) -> int:
+    depth = 0
+    in_single = False
+    in_double = False
+    for ch in s[:pos]:
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+    return depth
+
+
+def find_if_expr_end(s: str, start: int, base_paren: int) -> int:
+    depth = base_paren
+    nested_if = 0
+    i = start
+    in_single = False
+    in_double = False
+
+    while i < len(s):
+        ch = s[i]
+
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+
+        if in_double:
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+
+        if ch == "(":
+            depth += 1
+            i += 1
+            continue
+
+        if ch == ")":
+            if depth == base_paren and nested_if == 0:
+                return i
+            depth -= 1
+            i += 1
+            continue
+
+        if ch == "," and depth == base_paren and nested_if == 0:
+            return i
+
+        m = re.match(r"(?i)\bif\b", s[i:])
+        if m:
+            nested_if += 1
+            i += m.end()
+            continue
+
+        m = re.match(r"(?i)\belse\b", s[i:])
+        if m and nested_if > 0:
+            nested_if -= 1
+            i += m.end()
+            continue
+
+        i += 1
+
+    return len(s)
+
+
+def split_outer_if(s: str, start_if: int):
+    base_paren = paren_depth_at(s, start_if)
+    depth = base_paren
+    nested_if = 0
+    then_pos = None
+
+    j = start_if
+    in_single = False
+    in_double = False
+
+    while j < len(s):
+        ch = s[j]
+
+        if in_single:
+            if ch == "'":
+                in_single = False
+            j += 1
+            continue
+
+        if in_double:
+            if ch == '"':
+                in_double = False
+            j += 1
+            continue
+
+        if ch == "'":
+            in_single = True
+            j += 1
+            continue
+
+        if ch == '"':
+            in_double = True
+            j += 1
+            continue
+
+        if ch == "(":
+            depth += 1
+            j += 1
+            continue
+
+        if ch == ")":
+            depth -= 1
+            j += 1
+            continue
+
+        m = re.match(r"(?i)\bif\b", s[j:])
+        if m:
+            nested_if += 1
+            j += m.end()
+            continue
+
+        m = re.match(r"(?i)\bthen\b", s[j:])
+        if m:
+            if nested_if == 1 and then_pos is None:
+                then_pos = j
+            j += m.end()
+            continue
+
+        m = re.match(r"(?i)\belse\b", s[j:])
+        if m:
+            if nested_if == 1 and then_pos is not None:
+                else_pos = j
+                else_end = j + m.end()
+                expr_end = find_if_expr_end(s, else_end, base_paren)
+                condition = s[start_if + 2:then_pos].strip()
+                then_part = s[then_pos + 4:else_pos].strip()
+                else_part = s[else_end:expr_end].strip()
+                return condition, then_part, else_part, expr_end
+            elif nested_if > 1:
+                nested_if -= 1
+            j += m.end()
+            continue
+
+        j += 1
+
+    return None
+
+
+def convert_ifs(s: str) -> str:
+    out = ""
+    i = 0
+
+    while i < len(s):
+        m = re.search(r"(?i)\bif\b", s[i:])
+        if not m:
+            out += s[i:]
+            break
+
+        start = i + m.start()
+        out += s[i:start]
+
+        parts = split_outer_if(s, start)
+        if not parts:
+            out += s[start:]
+            break
+
+        condition, then_part, else_part, end_idx = parts
+        out += f"if({convert_ifs(condition)}, {convert_ifs(then_part)}, {convert_ifs(else_part)})"
+        i = end_idx
+
+    return out
+
+
+def split_top_level_args(s: str):
+    args = []
+    current = []
+    depth = 0
+    in_single = False
+    in_double = False
+
+    for ch in s:
+        if in_single:
+            current.append(ch)
+            if ch == "'":
+                in_single = False
+            continue
+
+        if in_double:
+            current.append(ch)
+            if ch == '"':
+                in_double = False
+            continue
+
+        if ch == "'":
+            in_single = True
+            current.append(ch)
+            continue
+
+        if ch == '"':
+            in_double = True
+            current.append(ch)
+            continue
+
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+            continue
+
+        if ch == ")":
+            depth -= 1
+            current.append(ch)
+            continue
+
+        if ch == "," and depth == 0:
+            args.append("".join(current).strip())
+            current = []
+            continue
+
+        current.append(ch)
+
+    args.append("".join(current).strip())
+    return args
+
+
+def replace_function_calls(s: str, func_name: str, replacer):
+    pattern = re.compile(rf"(?i)\b{re.escape(func_name)}\s*\(")
+    out = ""
+    i = 0
+
+    while True:
+        m = pattern.search(s, i)
+        if not m:
+            out += s[i:]
+            break
+
+        start = m.start()
+        out += s[i:start]
+
+        open_paren = s.find("(", m.start())
+        depth = 0
+        j = open_paren
+        in_single = False
+        in_double = False
+
+        while j < len(s):
+            ch = s[j]
+            if in_single:
+                if ch == "'":
+                    in_single = False
+            elif in_double:
+                if ch == '"':
+                    in_double = False
+            else:
+                if ch == "'":
+                    in_single = True
+                elif ch == '"':
+                    in_double = True
+                elif ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+            j += 1
+
+        inner = s[open_paren + 1:j]
+        out += replacer(inner)
+        i = j + 1
+
+    return out
+
+
+def wrap_var_names(s: str, var_name_map):
+    for original_name, output_name in sorted(var_name_map.items(), key=lambda item: len(item[0]), reverse=True):
+        if not original_name:
+            continue
+        s = re.sub(
+            rf"(?<![\[\w]){re.escape(original_name)}(?![\]\w])",
+            f"[{escape_attr(output_name)}]",
+            s,
+        )
+    return s
+
+
+def convert_formula_to_rapidminer(formula: str, var_name_map):
+    if formula is None:
+        return ""
+
+    s = str(formula).strip()
+    s = replace_quoted_refs_with_rm_inputs(s)
+
+    s = re.sub(
+        r"(\[[^\]]+\]|\b[A-Za-z_]\w*\b)\s*=\s*NoOutput\(\)",
+        r"missing(\1)",
+        s,
+        flags=re.I,
+    )
+
+    s = convert_ifs(s)
+
+    s = replace_function_calls(
+        s,
+        "PrevVal",
+        lambda inner: f"lag({split_top_level_args(inner)[0]}, 1)",
+    )
+
+    s = replace_function_calls(
+        s,
+        "BadVal",
+        lambda inner: f"missing({inner.strip()})",
+    )
+
+    def median_replacer(inner: str) -> str:
+        args = split_top_level_args(inner)
+        if len(args) == 3:
+            lo, val, hi = args
+            return f"min(max({val}, {lo}), {hi})"
+        return f"median({inner})"
+
+    s = replace_function_calls(s, "Median", median_replacer)
+    s = re.sub(r"(?i)\bNoOutput\(\)", NO_OUTPUT_TOKEN, s)
+    s = re.sub(r"(?i)\bAnd\b", " and ", s)
+    s = re.sub(r"(?i)\bOr\b", " or ", s)
+    s = re.sub(r"(?<![<>!=])=(?!=)", "==", s)
+    s = wrap_var_names(s, var_name_map)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def create_or_replace_sheet(wb, sheet_name):
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+    return wb.create_sheet(sheet_name)
+
+
+def process_workbook(input_path: str, output_path: str, sheet_name: str = SHEET_NAME):
+    wb = openpyxl.load_workbook(input_path)
+
+    if sheet_name not in wb.sheetnames:
+        raise ValueError(
+            f"Sheet '{sheet_name}' not found. Available sheets: {wb.sheetnames}"
+        )
+
+    ws = wb[sheet_name]
+
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    header_map = {str(h).strip(): idx + 1 for idx, h in enumerate(headers) if h is not None}
+
+    if "Variable_Names" not in header_map or "Formulas" not in header_map:
+        raise ValueError("Expected columns 'Variable_Names' and 'Formulas' in first row.")
+
+    var_col = header_map["Variable_Names"]
+    formula_col = header_map["Formulas"]
+
+    original_var_names = [ws.cell(r, var_col).value for r in range(2, ws.max_row + 1)]
+    var_name_map = {
+        str(name): strip_v_prefix(name)
+        for name in original_var_names
+        if name is not None and str(name).strip()
+    }
+
+    rm_var_col = ws.max_column + 1
+    formula_out_col = ws.max_column + 2
+    ws.cell(1, rm_var_col).value = "RapidMiner_Variable_Name"
+    ws.cell(1, formula_out_col).value = "RapidMiner_Formula"
+
+    all_refs = []
+    seen = set()
+
+    for r in range(2, ws.max_row + 1):
+        original_var = ws.cell(r, var_col).value
+        formula = ws.cell(r, formula_col).value
+
+        if original_var is not None:
+            ws.cell(r, rm_var_col).value = strip_v_prefix(original_var)
+
+        for ref in extract_quoted_refs(formula):
+            if ref not in seen:
+                seen.add(ref)
+                all_refs.append(ref)
+
+        converted = convert_formula_to_rapidminer(formula, var_name_map)
+        ws.cell(r, formula_out_col).value = converted
+
+    in_ws = create_or_replace_sheet(wb, "RapidMiner_Inputs")
+    in_ws["A1"] = "Original_Input_Name"
+    in_ws["B1"] = "Value"
+    in_ws["C1"] = "RapidMiner_Input_Name"
+
+    for idx, ref in enumerate(all_refs, start=2):
+        in_ws.cell(idx, 1).value = ref
+        in_ws.cell(idx, 2).value = None
+        in_ws.cell(idx, 3).value = rapidminer_input_name(ref)
+
+    in_ws.column_dimensions["A"].width = 45
+    in_ws.column_dimensions["B"].width = 15
+    in_ws.column_dimensions["C"].width = 45
+    ws.column_dimensions[openpyxl.utils.get_column_letter(rm_var_col)].width = 35
+    ws.column_dimensions[openpyxl.utils.get_column_letter(formula_out_col)].width = 90
+
+    wb.save(output_path)
+
+
+def resolve_paths(cli_input, cli_output):
+    input_path = cli_input or INPUT_FILE
+
+    if cli_output:
+        output_path = cli_output
+    else:
+        if OUTPUT_FILE:
+            output_path = OUTPUT_FILE
+        else:
+            p = Path(input_path)
+            output_path = str(p.with_name(f"{p.stem}_rapidminer{p.suffix}"))
+
+    return input_path, output_path
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Convert PI/Excel-style formulas to RapidMiner-ready formulas."
+    )
+    parser.add_argument("--input", help="Input Excel file path. If omitted, INPUT_FILE at the top is used.")
+    parser.add_argument("--output", help="Output Excel file path. If omitted, OUTPUT_FILE at the top is used.")
+    parser.add_argument("--sheet", default=SHEET_NAME, help="Formula sheet name")
+    args = parser.parse_args()
+
+    input_file, output_file = resolve_paths(args.input, args.output)
+    process_workbook(input_file, output_file, args.sheet)
+    print(f"Input workbook : {input_file}")
+    print(f"Output workbook: {output_file}")
