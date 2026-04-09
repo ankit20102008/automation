@@ -1074,3 +1074,146 @@ if __name__ == "__main__":
         sheets_to_process = SHEETS_TO_PROCESS
 
     process_workbook(input_file, output_file, sheets_to_process)
+
+
+
+
+
+from openpyxl import load_workbook
+from collections import OrderedDict
+
+# =====================================
+# USER SETTINGS
+# =====================================
+SOURCE_FILE = "template_rapidminer_all_sheets_side_by_side.xlsx"
+OUTPUT_FILE = "template_compiled_rm_lists.xlsx"
+
+FORMULA_MASTER_SHEET = "Compiled_Formulas"
+INPUT_MASTER_SHEET = "Compiled_Inputs"
+INPUT_SUFFIX = "_RM_input"
+
+
+# =====================================
+# HELPERS
+# =====================================
+def auto_fit_columns(ws):
+    for col_cells in ws.columns:
+        max_len = 0
+        col_idx = col_cells[0].column
+        for cell in col_cells:
+            value = "" if cell.value is None else str(cell.value)
+            if len(value) > max_len:
+                max_len = len(value)
+        ws.column_dimensions[ws.cell(1, col_idx).column_letter].width = min(max(max_len + 2, 14), 80)
+
+
+def find_header_col(ws, target_names):
+    targets = {str(x).strip().lower() for x in target_names}
+    for c in range(1, ws.max_column + 1):
+        val = ws.cell(1, c).value
+        if val is None:
+            continue
+        if str(val).strip().lower() in targets:
+            return c
+    return None
+
+
+def delete_sheet_if_exists(wb, sheet_name):
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+
+
+# =====================================
+# MAIN LOGIC
+# =====================================
+def compile_lists(source_file, output_file):
+    wb = load_workbook(source_file)
+
+    formula_rows = []
+    input_map = OrderedDict()
+
+    processed_formula_sheets = []
+    processed_input_sheets = []
+
+    for ws in wb.worksheets:
+        sheet_name = ws.title
+
+        # Skip previously compiled sheets if present
+        if sheet_name in {FORMULA_MASTER_SHEET, INPUT_MASTER_SHEET}:
+            continue
+
+        # Formula sheets
+        if not sheet_name.endswith(INPUT_SUFFIX):
+            rm_name_col = find_header_col(ws, ["RapidMiner_Variable_Name"])
+            rm_formula_col = find_header_col(ws, ["RapidMiner_Formula"])
+
+            if rm_name_col and rm_formula_col:
+                processed_formula_sheets.append(sheet_name)
+
+                for r in range(2, ws.max_row + 1):
+                    rm_name = ws.cell(r, rm_name_col).value
+                    rm_formula = ws.cell(r, rm_formula_col).value
+
+                    rm_name = None if rm_name is None else str(rm_name).strip()
+                    rm_formula = None if rm_formula is None else str(rm_formula).strip()
+
+                    if rm_name and rm_formula:
+                        formula_rows.append((rm_name, rm_formula))
+
+        # Input sheets
+        if sheet_name.endswith(INPUT_SUFFIX):
+            original_col = find_header_col(ws, ["Original_Input_Name"])
+            rm_input_col = find_header_col(ws, ["RapidMiner_Input_Name"])
+
+            if original_col and rm_input_col:
+                processed_input_sheets.append(sheet_name)
+
+                for r in range(2, ws.max_row + 1):
+                    original_name = ws.cell(r, original_col).value
+                    rm_input_name = ws.cell(r, rm_input_col).value
+
+                    original_name = None if original_name is None else str(original_name).strip()
+                    rm_input_name = None if rm_input_name is None else str(rm_input_name).strip()
+
+                    if original_name and rm_input_name:
+                        # Keep first mapping if duplicates appear
+                        if original_name not in input_map:
+                            input_map[original_name] = rm_input_name
+
+    # Remove old compiled sheets if they already exist
+    delete_sheet_if_exists(wb, FORMULA_MASTER_SHEET)
+    delete_sheet_if_exists(wb, INPUT_MASTER_SHEET)
+
+    # Create compiled formulas sheet
+    ws_formula = wb.create_sheet(FORMULA_MASTER_SHEET)
+    ws_formula.append(["RapidMiner_Name", "RapidMiner_Formula"])
+    for rm_name, rm_formula in formula_rows:
+        ws_formula.append([rm_name, rm_formula])
+
+    # Create compiled inputs sheet
+    ws_inputs = wb.create_sheet(INPUT_MASTER_SHEET)
+    ws_inputs.append(["Original_Name", "RapidMiner_Input_Name"])
+    for original_name, rm_input_name in input_map.items():
+        ws_inputs.append([original_name, rm_input_name])
+
+    auto_fit_columns(ws_formula)
+    auto_fit_columns(ws_inputs)
+
+    wb.save(output_file)
+
+    print(f"Source workbook : {source_file}")
+    print(f"Output workbook : {output_file}")
+    print("-" * 60)
+    print(f"Formula sheets compiled : {len(processed_formula_sheets)}")
+    for s in processed_formula_sheets:
+        print(f"  - {s}")
+    print(f"Input sheets compiled   : {len(processed_input_sheets)}")
+    for s in processed_input_sheets:
+        print(f"  - {s}")
+    print(f"Total formulas written  : {len(formula_rows)}")
+    print(f"Total unique inputs     : {len(input_map)}")
+
+
+if __name__ == "__main__":
+    compile_lists(SOURCE_FILE, OUTPUT_FILE)
+
