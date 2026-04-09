@@ -505,7 +505,7 @@ if __name__ == "__main__":
     parser.add_argument("--input", help="Input Excel file path. If omitted, INPUT_FILE at the top is used.")
     parser.add_argument("--output", help="Output Excel file path. If omitted, OUTPUT_FILE at the top is used.")
     parser.add_argument("--sheet", default=SHEET_NAME, help="Formula sheet name")
-    args = parser.parse_args()
+    args, unknown = parser.parse_known_args()
 
     input_file, output_file = resolve_paths(args.input, args.output)
     process_workbook(input_file, output_file, args.sheet)
