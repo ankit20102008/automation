@@ -1,0 +1,86 @@
+import os
+import re
+import glob
+from pathlib import Path
+import pandas as pd
+
+# ==========================================
+# CONFIG
+# ==========================================
+input_folder = r"C:\your_folder_with_excels"   # change this
+output_file = r"C:\your_folder_with_excels\master.xlsx"
+
+# Supported Excel types
+file_patterns = ["*.xlsx", "*.xlsm", "*.xls"]
+
+# ==========================================
+# FUNCTION: EXTRACT REQUEST ID FROM FILE NAME
+# ==========================================
+def extract_request_id(file_path):
+    """
+    Examples:
+    347.xlsx                  -> 347
+    request ID 348.xlsx       -> 348
+    Req_349_final.xlsx        -> 349
+    """
+    file_stem = Path(file_path).stem  # filename without extension
+
+    # extract first number found in file name
+    match = re.search(r'\d+', file_stem)
+    if match:
+        return match.group(0)
+
+    # if no number found, return full file name without extension
+    return file_stem
+
+# ==========================================
+# GET ALL EXCEL FILES
+# ==========================================
+excel_files = []
+for pattern in file_patterns:
+    excel_files.extend(glob.glob(os.path.join(input_folder, pattern)))
+
+excel_files = [f for f in excel_files if os.path.abspath(f) != os.path.abspath(output_file)]
+
+if not excel_files:
+    raise FileNotFoundError("No Excel files found in the input folder.")
+
+print(f"Found {len(excel_files)} Excel files.")
+
+# ==========================================
+# COLLECT DATA SHEET-WISE
+# ==========================================
+master_data = {}
+
+for file in excel_files:
+    file_name = os.path.basename(file)
+    request_id = extract_request_id(file)
+
+    print(f"Processing: {file_name}  |  Request_ID = {request_id}")
+
+    xl = pd.ExcelFile(file)
+
+    for sheet in xl.sheet_names:
+        df = pd.read_excel(file, sheet_name=sheet)
+
+        # Remove existing Request_ID column if already present
+        if "Request_ID" in df.columns:
+            df = df.drop(columns=["Request_ID"])
+
+        # Add Request_ID as LAST column
+        df["Request_ID"] = request_id
+
+        if sheet not in master_data:
+            master_data[sheet] = []
+
+        master_data[sheet].append(df)
+
+# ==========================================
+# WRITE MASTER EXCEL
+# ==========================================
+with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+    for sheet, df_list in master_data.items():
+        combined_df = pd.concat(df_list, ignore_index=True, sort=False)
+        combined_df.to_excel(writer, sheet_name=sheet, index=False)
+
+print(f"\nMaster workbook created successfully:\n{output_file}")
