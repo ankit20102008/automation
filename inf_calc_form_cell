@@ -1,0 +1,362 @@
+import re
+import pandas as pd
+from pathlib import Path
+
+
+# =========================================================
+# USER INPUT
+# =========================================================
+INPUT_FILE = r"C:\Users\YourName\Desktop\piaf_analysis.xlsx"
+OUTPUT_FILE = r"C:\Users\YourName\Desktop\piaf_analysis_converted.xlsx"
+
+REMOVE_V_PREFIX = True
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+def normalize_colname(col):
+    return str(col).strip().lower()
+
+
+def clean_sheet_name(name, max_len=31):
+    name = re.sub(r'[:\\/*?\[\]]', '_', str(name))
+    return name[:max_len]
+
+
+def split_statements(config_text):
+    """
+    Split a PI AF AnalysisRuleConfigString into statements by semicolon.
+    Assumes top-level ';' separates statements.
+    """
+    if pd.isna(config_text):
+        return []
+
+    text = str(config_text).replace("\r", "\n")
+    parts = [p.strip() for p in text.split(";")]
+    return [p for p in parts if p]
+
+
+def transform_variable_name(var_name, remove_v_prefix=True):
+    """
+    Example:
+      vABC_DEF -> ABC_DEF
+    """
+    var_name = str(var_name).strip()
+    if remove_v_prefix and re.match(r"^v[A-Za-z0-9_]", var_name):
+        return var_name[1:]
+    return var_name
+
+
+def make_rm_input_name(raw_ref):
+    """
+    Convert raw PI AF input references to RapidMiner-style input names.
+
+    Examples:
+      Lean Carbonate Recycled_Flow|Lo -> inp_Lean_Carbonate_Recycled_Flow_Lo
+      Total Carbonate PI Tag|DF       -> inp_Total_Carbonate_PI_Tag_DF
+      Some Tag Name                   -> inp_Some_Tag_Name
+    """
+    raw_ref = str(raw_ref).strip()
+
+    # Replace PI AF suffixes like |Lo, |Hi, |DF, |DS
+    raw_ref = raw_ref.replace("|", "_")
+
+    # Replace spaces and invalid chars with underscore
+    raw_ref = re.sub(r"[^A-Za-z0-9_]", "_", raw_ref)
+
+    # Collapse multiple underscores
+    raw_ref = re.sub(r"_+", "_", raw_ref).strip("_")
+
+    return f"inp_{raw_ref}"
+
+
+def parse_assignments(config_text):
+    """
+    Parse:
+      vABC := formula
+      vXYZ := another formula
+
+    Returns list of tuples:
+      [(lhs, rhs), ...]
+    """
+    statements = split_statements(config_text)
+    assignments = []
+
+    for stmt in statements:
+        if ":=" in stmt:
+            lhs, rhs = stmt.split(":=", 1)
+            lhs = lhs.strip()
+            rhs = rhs.strip()
+            if lhs:
+                assignments.append((lhs, rhs))
+
+    return assignments
+
+
+def replace_badval(expr):
+    """
+    Replace BadVal(...) or BadVal with MISSING_NUMERIC
+    """
+    expr = re.sub(r"\bBadVal\s*\([^)]*\)", "MISSING_NUMERIC", expr, flags=re.IGNORECASE)
+    expr = re.sub(r"\bBadVal\b", "MISSING_NUMERIC", expr, flags=re.IGNORECASE)
+    return expr
+
+
+def replace_logicals(expr):
+    """
+    AND -> &&
+    OR  -> ||
+    """
+    expr = re.sub(r"\bAND\b", "&&", expr, flags=re.IGNORECASE)
+    expr = re.sub(r"\bOR\b", "||", expr, flags=re.IGNORECASE)
+    return expr
+
+
+def replace_missing(expr):
+    """
+    Optional common conversion:
+      is_missing(x) -> missing(x)
+    """
+    expr = re.sub(r"\bis_missing\s*\(", "missing(", expr, flags=re.IGNORECASE)
+    return expr
+
+
+def replace_comparisons(expr):
+    """
+    Convert:
+      <> -> !=
+      =  -> ==
+    but do not disturb >= <= != ==
+    """
+    expr = re.sub(r"<>", "!=", expr)
+    expr = re.sub(r"(?<![<>=!])=(?![=])", "==", expr)
+    return expr
+
+
+def convert_if_then_else(expr):
+    """
+    Convert simple PI AF style:
+      if condition then x else y
+    into:
+      if(condition, x, y)
+
+    Applies recursively for nested ifs where possible.
+    """
+    expr = expr.strip()
+
+    pattern = re.compile(
+        r"^\s*if\s+(.*?)\s+then\s+(.*?)\s+else\s+(.*)\s*$",
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    m = pattern.match(expr)
+    if not m:
+        return expr
+
+    cond, true_part, false_part = m.groups()
+    cond = convert_if_then_else(cond.strip())
+    true_part = convert_if_then_else(true_part.strip())
+    false_part = convert_if_then_else(false_part.strip())
+
+    return f"if({cond}, {true_part}, {false_part})"
+
+
+def replace_variable_references(expr, calc_var_map):
+    """
+    Replace calculated vars in formulas:
+      vABC -> ABC
+    using word-boundary safe replacement.
+    """
+    for old_var in sorted(calc_var_map.keys(), key=len, reverse=True):
+        new_var = calc_var_map[old_var]
+        expr = re.sub(rf"\b{re.escape(old_var)}\b", new_var, expr)
+    return expr
+
+
+def replace_external_inputs(expr, calc_var_map):
+    """
+    Replace quoted/unquoted external PI AF references with inp_ names,
+    while leaving already-calculated variables untouched.
+
+    This function tries to identify tokens that look like PI AF attributes.
+    """
+    # Match tokens like:
+    #   Some Tag
+    #   Some_Tag|Lo
+    #   "Some Tag|DF"
+    # but skip function names and calculated vars already mapped.
+    #
+    # We will replace quoted tags first.
+    def quoted_repl(match):
+        token = match.group(1).strip()
+        if token in calc_var_map:
+            return calc_var_map[token]
+        return make_rm_input_name(token)
+
+    expr = re.sub(r'"([^"]+)"', quoted_repl, expr)
+
+    # Replace bare PI AF references containing pipe
+    def pipe_repl(match):
+        token = match.group(0).strip()
+        if token in calc_var_map:
+            return calc_var_map[token]
+        return make_rm_input_name(token)
+
+    expr = re.sub(r"\b[A-Za-z0-9_ ]+\|[A-Za-z0-9_]+\b", pipe_repl, expr)
+
+    return expr
+
+
+def convert_formula(expr, calc_var_map):
+    """
+    Full formula conversion pipeline.
+    """
+    expr = str(expr).strip()
+
+    expr = replace_variable_references(expr, calc_var_map)
+    expr = replace_badval(expr)
+    expr = replace_missing(expr)
+    expr = replace_logicals(expr)
+    expr = replace_comparisons(expr)
+    expr = convert_if_then_else(expr)
+    expr = replace_external_inputs(expr, calc_var_map)
+
+    # cleanup spaces
+    expr = re.sub(r"[ \t]+", " ", expr).strip()
+    return expr
+
+
+def extract_external_inputs_from_formula(formula, calc_var_map):
+    """
+    Find PI AF-style external references from original formula.
+    Returns unique list.
+    """
+    refs = set()
+
+    # quoted refs
+    for m in re.finditer(r'"([^"]+)"', formula):
+        token = m.group(1).strip()
+        if token not in calc_var_map:
+            refs.add(token)
+
+    # refs with pipe suffix like Tag|Lo
+    for m in re.finditer(r"\b[A-Za-z0-9_ ]+\|[A-Za-z0-9_]+\b", formula):
+        token = m.group(0).strip()
+        if token not in calc_var_map:
+            refs.add(token)
+
+    return sorted(refs)
+
+
+# =========================================================
+# CORE PROCESSING
+# =========================================================
+def process_sheet(df, sheet_name):
+    cols_norm = {normalize_colname(c): c for c in df.columns}
+
+    if "name" not in cols_norm or "analysisruleconfigstring" not in cols_norm:
+        return None, None
+
+    name_col = cols_norm["name"]
+    config_col = cols_norm["analysisruleconfigstring"]
+
+    formula_rows = []
+    input_rows = []
+
+    for idx, row in df.iterrows():
+        analysis_name = row.get(name_col, "")
+        config_text = row.get(config_col, "")
+
+        if pd.isna(config_text) or str(config_text).strip() == "":
+            continue
+
+        assignments = parse_assignments(config_text)
+        if not assignments:
+            continue
+
+        calc_var_map = {
+            lhs: transform_variable_name(lhs, remove_v_prefix=REMOVE_V_PREFIX)
+            for lhs, _ in assignments
+        }
+
+        for lhs, rhs in assignments:
+            rm_name = calc_var_map[lhs]
+            rm_formula = convert_formula(rhs, calc_var_map)
+
+            formula_rows.append({
+                "sheet_name": sheet_name,
+                "analysis_name": analysis_name,
+                "original_name": lhs,
+                "rapidminer_name": rm_name,
+                "rapidminer_formula": rm_formula
+            })
+
+            external_refs = extract_external_inputs_from_formula(rhs, calc_var_map)
+            for ref in external_refs:
+                input_rows.append({
+                    "sheet_name": sheet_name,
+                    "analysis_name": analysis_name,
+                    "original_name": ref,
+                    "rapidminer_input_name": make_rm_input_name(ref)
+                })
+
+    formula_df = pd.DataFrame(formula_rows)
+    input_df = pd.DataFrame(input_rows)
+
+    if not input_df.empty:
+        input_df = input_df.drop_duplicates().sort_values(
+            by=["sheet_name", "analysis_name", "original_name"]
+        ).reset_index(drop=True)
+
+    if not formula_df.empty:
+        formula_df = formula_df.drop_duplicates().reset_index(drop=True)
+
+    return formula_df, input_df
+
+
+def main():
+    input_path = Path(INPUT_FILE)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
+
+    excel_file = pd.ExcelFile(INPUT_FILE)
+    compiled_formula_list = []
+    compiled_input_list = []
+
+    with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as writer:
+        for sheet in excel_file.sheet_names:
+            df = pd.read_excel(INPUT_FILE, sheet_name=sheet)
+
+            formula_df, input_df = process_sheet(df, sheet)
+
+            if formula_df is None and input_df is None:
+                continue
+
+            safe_sheet = clean_sheet_name(sheet)
+
+            if formula_df is not None and not formula_df.empty:
+                out_formula_sheet = clean_sheet_name(f"{safe_sheet}_RM_formula")
+                formula_df.to_excel(writer, sheet_name=out_formula_sheet, index=False)
+                compiled_formula_list.append(formula_df)
+
+            if input_df is not None and not input_df.empty:
+                out_input_sheet = clean_sheet_name(f"{safe_sheet}_RM_input")
+                input_df.to_excel(writer, sheet_name=out_input_sheet, index=False)
+                compiled_input_list.append(input_df)
+
+        # Compiled sheets
+        if compiled_formula_list:
+            compiled_formula_df = pd.concat(compiled_formula_list, ignore_index=True)
+            compiled_formula_df.to_excel(writer, sheet_name="compiled_RM_formula", index=False)
+
+        if compiled_input_list:
+            compiled_input_df = pd.concat(compiled_input_list, ignore_index=True)
+            compiled_input_df = compiled_input_df.drop_duplicates().reset_index(drop=True)
+            compiled_input_df.to_excel(writer, sheet_name="compiled_RM_input", index=False)
+
+    print(f"Done. Output written to:\n{OUTPUT_FILE}")
+
+
+if __name__ == "__main__":
+    main()
