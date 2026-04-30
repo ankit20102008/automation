@@ -273,3 +273,91 @@ def process_formula_sheet(wb, ws):
         "input_count": len(sorted_inputs),
         "row_count": ws.max_row - 1,
     }
+---------------------------------------------------------------------------
+def rebuild_consolidated_all_sheet(wb, processed_sheet_names):
+    """
+    Rebuild consolidated_all from all processed analysis sheets.
+    Adds Analysis_Name column and keeps duplicate rows.
+    """
+
+    existing_consolidated = None
+
+    for sheet_name in wb.sheetnames:
+        if sheet_name.strip().lower() == "consolidated_all":
+            existing_consolidated = sheet_name
+            break
+
+    if existing_consolidated:
+        del wb[existing_consolidated]
+
+    consolidated_ws = wb.create_sheet("consolidated_all")
+
+    final_headers = ["Analysis_Name"]
+    seen_headers = {"analysis_name"}
+
+    for sheet_name in processed_sheet_names:
+        ws = wb[sheet_name]
+
+        for c in range(1, ws.max_column + 1):
+            header_value = ws.cell(1, c).value
+
+            if header_value is None:
+                continue
+
+            header = str(header_value).strip()
+
+            if not header:
+                continue
+
+            header_key = header.lower()
+
+            if header_key == "analysis_name":
+                continue
+
+            if header_key not in seen_headers:
+                final_headers.append(header)
+                seen_headers.add(header_key)
+
+    consolidated_ws.append(final_headers)
+
+    total_rows_added = 0
+
+    for sheet_name in processed_sheet_names:
+        ws = wb[sheet_name]
+
+        source_header_to_col = {}
+
+        for c in range(1, ws.max_column + 1):
+            header_value = ws.cell(1, c).value
+
+            if header_value is None:
+                continue
+
+            header = str(header_value).strip()
+
+            if header:
+                source_header_to_col[header.lower()] = c
+
+        for r in range(2, ws.max_row + 1):
+            row_has_data = any(
+                ws.cell(r, c).value is not None
+                for c in range(1, ws.max_column + 1)
+            )
+
+            if not row_has_data:
+                continue
+
+            output_row = [sheet_name]
+
+            for header in final_headers[1:]:
+                col_idx = source_header_to_col.get(header.lower())
+
+                if col_idx:
+                    output_row.append(ws.cell(r, col_idx).value)
+                else:
+                    output_row.append(None)
+
+            consolidated_ws.append(output_row)
+            total_rows_added += 1
+
+    return total_rows_added
