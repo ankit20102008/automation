@@ -95,3 +95,181 @@ def process_workbook(input_path: str, output_path: str, requested_sheets=None):
         print("Skipped sheets:")
         for name, reason in skipped:
             print(f"  - {name}: {reason}")
+
+
+Analysis_Name | Original_Input_Name | Value | RapidMiner_Input_Name
+-------------------------------------------------------------------
+def get_header_col(ws, header_names):
+    wanted = {h.strip().lower() for h in header_names}
+
+    for c in range(1, ws.max_column + 1):
+        value = ws.cell(1, c).value
+        if value is None:
+            continue
+
+        header = str(value).strip().lower()
+        if header in wanted:
+            return c
+
+    return None
+---------------------------------
+def create_side_by_side_input_sheet(wb, source_ws, inputs, include_analysis_name=False):
+    source_index = wb.sheetnames.index(source_ws.title)
+
+    existing_values = {}
+    sheet_to_delete = None
+
+    # If the next tab is already an RM input sheet, reuse its values and replace it.
+    if source_index + 1 < len(wb.sheetnames):
+        next_name = wb.sheetnames[source_index + 1]
+        if next_name.endswith(INPUT_SUFFIX):
+            existing_values = extract_existing_input_values(wb[next_name])
+            sheet_to_delete = next_name
+
+    existing_names_for_new = list(wb.sheetnames)
+    if sheet_to_delete:
+        existing_names_for_new = [n for n in existing_names_for_new if n != sheet_to_delete]
+
+    new_input_sheet_name = build_input_sheet_name(source_ws.title, existing_names_for_new)
+
+    # If same target name exists elsewhere, preserve values and replace it.
+    if new_input_sheet_name in wb.sheetnames and new_input_sheet_name != sheet_to_delete:
+        existing_values = extract_existing_input_values(wb[new_input_sheet_name]) or existing_values
+        del wb[new_input_sheet_name]
+
+    if sheet_to_delete and sheet_to_delete in wb.sheetnames:
+        del wb[sheet_to_delete]
+        source_index = wb.sheetnames.index(source_ws.title)
+
+    input_ws = wb.create_sheet(title=new_input_sheet_name, index=source_index + 1)
+
+    if include_analysis_name:
+        input_ws.append([
+            "Analysis_Name",
+            "Original_Input_Name",
+            "Value",
+            "RapidMiner_Input_Name"
+        ])
+
+        for analysis_name, original_name, rm_name in inputs:
+            input_ws.append([
+                analysis_name,
+                original_name,
+                existing_values.get(original_name),
+                rm_name
+            ])
+
+    else:
+        input_ws.append([
+            "Original_Input_Name",
+            "Value",
+            "RapidMiner_Input_Name"
+        ])
+
+        for original_name, rm_name in inputs:
+            input_ws.append([
+                original_name,
+                existing_values.get(original_name),
+                rm_name
+            ])
+
+    return input_ws.title
+----------------------------------------
+
+def process_formula_sheet(wb, ws):
+    var_col, formula_col = detect_formula_columns(ws)
+    if not var_col or not formula_col:
+        return None
+
+    rm_var_col, rm_formula_col = get_or_create_output_columns(ws)
+    input_map = {}
+
+    # Detect Analysis_Name column if present.
+    # This is mainly required for Consolidated_All.
+    analysis_name_col = get_header_col(ws, [
+        "Analysis_Name",
+        "Analysis Name",
+        "analysis_name",
+        "analysis name"
+    ])
+
+    # This will be used only when source sheet has Analysis_Name column.
+    # It keeps input mapping analysis-wise.
+    analysis_input_rows = []
+    seen_analysis_input_rows = set()
+
+    for r in range(2, ws.max_row + 1):
+        var_value = ws.cell(r, var_col).value
+        formula_value = ws.cell(r, formula_col).value
+
+        if var_value is not None:
+            var_name = str(var_value).strip()
+            ws.cell(r, rm_var_col).value = var_name[1:] if var_name.startswith("v") else var_name
+
+        if formula_value is None:
+            continue
+
+        if isinstance(formula_value, (int, float)):
+            ws.cell(r, rm_formula_col).value = formula_value
+            continue
+
+        formula_text = str(formula_value).strip()
+
+        if formula_text == "":
+            ws.cell(r, rm_formula_col).value = ""
+            continue
+
+        transformed_formula = transform_expression(formula_text, input_map)
+        ws.cell(r, rm_formula_col).value = transformed_formula
+
+        # For Consolidated_All_RM_Input:
+        # collect input usage with Analysis_Name.
+        if analysis_name_col:
+            analysis_name = ws.cell(r, analysis_name_col).value
+
+            if analysis_name is None or str(analysis_name).strip() == "":
+                analysis_name = ws.title
+            else:
+                analysis_name = str(analysis_name).strip()
+
+            # Find which generated RapidMiner inputs are used in this transformed formula
+            for original_name, rm_name in input_map.items():
+                if f"[{rm_name}]" in transformed_formula:
+                    key = (analysis_name, original_name, rm_name)
+
+                    # Do not collapse same input across different analysis names.
+                    # Only avoid exact repeated same analysis + same input row.
+                    if key not in seen_analysis_input_rows:
+                        analysis_input_rows.append(key)
+                        seen_analysis_input_rows.add(key)
+
+    # If sheet has Analysis_Name column, create RM input sheet with Analysis_Name also.
+    if analysis_name_col:
+        sorted_inputs = sorted(
+            analysis_input_rows,
+            key=lambda x: (str(x[0]).lower(), str(x[1]).lower())
+        )
+
+        rm_input_sheet_name = create_side_by_side_input_sheet(
+            wb,
+            ws,
+            sorted_inputs,
+            include_analysis_name=True
+        )
+
+    else:
+        sorted_inputs = sorted(input_map.items(), key=lambda x: x[0].lower())
+
+        rm_input_sheet_name = create_side_by_side_input_sheet(
+            wb,
+            ws,
+            sorted_inputs,
+            include_analysis_name=False
+        )
+
+    return {
+        "sheet_name": ws.title,
+        "rm_input_sheet_name": rm_input_sheet_name,
+        "input_count": len(sorted_inputs),
+        "row_count": ws.max_row - 1,
+    }
