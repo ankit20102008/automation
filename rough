@@ -8,3 +8,16 @@ text = re.sub(r"(?i)\bAND\b", " && ", text)
 text = re.sub(r"(?i)\bOR\b", " || ", text)
 text = re.sub(r"(?i)\bNOT\b", " ! ", text)
 
+if fname_l in {"avg", "average"}:
+    if len(args) == 0:
+        return NO_OUTPUT_TOKEN
+
+    transformed_args = [
+        transform_expression(arg, input_map, input_events)
+        for arg in args
+    ]
+
+    if len(transformed_args) == 1:
+        return transformed_args[0]
+
+    return "((" + " + ".join(transformed_args) + f") / {len(transformed_args)})"
