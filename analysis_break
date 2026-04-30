@@ -1,0 +1,187 @@
+import re
+from artifact_tool import Blob, SpreadsheetFile, Workbook
+
+INPUT_PATH = "sample_analysis.xlsx"
+OUTPUT_PATH = "pi_af_analysis_breakdown.xlsx"
+
+def clean_text(value):
+    return "" if value is None else str(value)
+
+def safe_excel_literal(value):
+    text = "" if value is None else str(value)
+    return "'" + text if text.startswith(("=", "+", "-", "@")) else text
+
+def parse_rule_config(config_text):
+    text = clean_text(config_text).replace("_x000D_", "").replace(":= ", ":=")
+    rows = []
+    for part in [p.strip() for p in text.split(";")]:
+        if not part:
+            continue
+        if ":=" in part:
+            variable, formula = part.split(":=", 1)
+            rows.append((variable.strip(), formula.strip()))
+        else:
+            rows.append((part.strip(), ""))
+    return rows
+
+def parse_variable_mapping(mapping_text):
+    mapping = {}
+    ordered = []
+    for part in [p.strip() for p in clean_text(mapping_text).split(";")]:
+        if not part:
+            continue
+        if " || " in part:
+            variable, attribute = part.split(" || ", 1)
+        elif "||" in part:
+            variable, attribute = part.split("||", 1)
+        else:
+            variable, attribute = part, ""
+        variable = variable.strip()
+        attribute = attribute.strip()
+        if variable:
+            mapping[variable] = attribute
+            ordered.append((variable, attribute))
+    return mapping, ordered
+
+def sanitize_sheet_name(name, used_names):
+    raw = clean_text(name).strip() or "Analysis"
+    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", "_", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip() or "Analysis"
+    base = cleaned[:31]
+    candidate = base
+    counter = 1
+    lower_used = {x.lower() for x in used_names}
+    while candidate.lower() in lower_used:
+        suffix = f"_{counter}"
+        candidate = base[:31-len(suffix)] + suffix
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+def main():
+    wb_in = SpreadsheetFile.import_xlsx(Blob.load(INPUT_PATH))
+    input_sheet = wb_in.worksheets.get_item(wb_in.worksheets.get_sheet_name_by_index(0))
+    data = input_sheet.get_used_range().values
+    headers = [clean_text(x).strip().lower() for x in data[0]]
+
+    name_idx = next((i for i, h in enumerate(headers) if h == "name" or "name" in h), 0)
+    config_idx = next((i for i, h in enumerate(headers) if "analysisruleconfigstring" in h), 1)
+    mapping_idx = next((i for i, h in enumerate(headers) if "analysisrulevariablemapping" in h), 2)
+
+    processed = []
+    for source_row, row in enumerate(data[1:], start=2):
+        row = list(row) + [""] * max(0, 3 - len(row))
+        analysis_name = clean_text(row[name_idx]).strip() or f"Row {source_row}"
+        config_text = row[config_idx] if config_idx < len(row) else ""
+        mapping_text = row[mapping_idx] if mapping_idx < len(row) else ""
+        if not clean_text(config_text).strip() and not clean_text(mapping_text).strip():
+            continue
+
+        formula_rows = parse_rule_config(config_text)
+        mapping_dict, mapping_ordered = parse_variable_mapping(mapping_text)
+
+        output_rows = []
+        seen_vars = set()
+        for variable, formula in formula_rows:
+            seen_vars.add(variable)
+            output_rows.append([variable, formula, mapping_dict.get(variable, "")])
+
+        for variable, attribute in mapping_ordered:
+            if variable not in seen_vars:
+                output_rows.append([variable, "", attribute])
+
+        processed.append({
+            "source_row": source_row,
+            "analysis_name": analysis_name,
+            "rows": output_rows,
+            "formula_count": len(formula_rows),
+            "mapping_count": len(mapping_ordered),
+            "matched_count": sum(1 for variable, _ in formula_rows if variable in mapping_dict),
+            "unmatched_mapping_count": sum(1 for variable, _ in mapping_ordered if variable not in seen_vars),
+        })
+
+    wb_out = Workbook.create()
+    used_names = set()
+
+    summary = wb_out.worksheets.add("Summary")
+    summary_rows = [["Source Row", "Analysis Name", "Output Sheet", "Formula Rows", "Mapping Rows", "Matched Mapping Rows", "Unmatched Mapping Rows"]]
+    consolidated_rows = [["Analysis Name", "Variable", "Formula", "Mapping Attribute"]]
+
+    for item in processed:
+        sheet_name = sanitize_sheet_name(item["analysis_name"], used_names)
+        ws = wb_out.worksheets.add(sheet_name)
+        rows = [["Variable", "Formula", "Mapping Attribute"]]
+
+        for variable, formula, attribute in item["rows"]:
+            rows.append([safe_excel_literal(variable), safe_excel_literal(formula), safe_excel_literal(attribute)])
+            consolidated_rows.append([safe_excel_literal(item["analysis_name"]), safe_excel_literal(variable), safe_excel_literal(formula), safe_excel_literal(attribute)])
+
+        ws.get_range(f"A1:C{len(rows)}").values = rows
+        ws.get_range("A1:C1").format = {
+            "fill": "#EAF2F8",
+            "font": {"bold": True, "color": "#1F2937", "size": 11},
+            "borders": {"preset": "bottom", "style": "thin", "color": "#CBD5E1"},
+            "horizontalAlignment": "center",
+            "verticalAlignment": "center",
+            "wrapText": True,
+        }
+        ws.get_range(f"A2:C{len(rows)}").format = {
+            "font": {"size": 10, "color": "#111827"},
+            "borders": {"preset": "inside", "style": "thin", "color": "#E5E7EB"},
+            "verticalAlignment": "top",
+            "wrapText": True,
+        }
+        ws.get_range("A1:A1").format.column_width = 34
+        ws.get_range("B1:B1").format.column_width = 95
+        ws.get_range("C1:C1").format.column_width = 42
+        ws.freeze_panes.freeze_rows(1)
+
+        summary_rows.append([item["source_row"], item["analysis_name"], sheet_name, item["formula_count"], item["mapping_count"], item["matched_count"], item["unmatched_mapping_count"]])
+
+    summary.get_range(f"A1:G{len(summary_rows)}").values = summary_rows
+    summary.get_range("A1:G1").format = {
+        "fill": "#EAF2F8",
+        "font": {"bold": True, "color": "#1F2937", "size": 11},
+        "borders": {"preset": "bottom", "style": "thin", "color": "#CBD5E1"},
+        "horizontalAlignment": "center",
+        "verticalAlignment": "center",
+        "wrapText": True,
+    }
+    summary.get_range(f"A2:G{len(summary_rows)}").format = {
+        "font": {"size": 10, "color": "#111827"},
+        "borders": {"preset": "inside", "style": "thin", "color": "#E5E7EB"},
+        "verticalAlignment": "top",
+        "wrapText": True,
+    }
+    summary.get_range("A1:A1").format.column_width = 12
+    summary.get_range("B1:B1").format.column_width = 42
+    summary.get_range("C1:C1").format.column_width = 34
+    summary.get_range("D1:G1").format.column_width = 18
+    summary.freeze_panes.freeze_rows(1)
+
+    consolidated = wb_out.worksheets.add("Consolidated_All")
+    consolidated.get_range(f"A1:D{len(consolidated_rows)}").values = consolidated_rows
+    consolidated.get_range("A1:D1").format = {
+        "fill": "#EAF2F8",
+        "font": {"bold": True, "color": "#1F2937", "size": 11},
+        "borders": {"preset": "bottom", "style": "thin", "color": "#CBD5E1"},
+        "horizontalAlignment": "center",
+        "verticalAlignment": "center",
+        "wrapText": True,
+    }
+    consolidated.get_range(f"A2:D{len(consolidated_rows)}").format = {
+        "font": {"size": 10, "color": "#111827"},
+        "borders": {"preset": "inside", "style": "thin", "color": "#E5E7EB"},
+        "verticalAlignment": "top",
+        "wrapText": True,
+    }
+    consolidated.get_range("A1:A1").format.column_width = 42
+    consolidated.get_range("B1:B1").format.column_width = 34
+    consolidated.get_range("C1:C1").format.column_width = 95
+    consolidated.get_range("D1:D1").format.column_width = 42
+    consolidated.freeze_panes.freeze_rows(1)
+
+    SpreadsheetFile.export_xlsx(wb_out).save(OUTPUT_PATH)
+
+if __name__ == "__main__":
+    main()
