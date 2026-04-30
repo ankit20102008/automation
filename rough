@@ -29,3 +29,69 @@ SKIP_MAIN_SHEETS = {
     "summary",
     "consolidated_all"
 }
+
+
+
+def process_workbook(input_path: str, output_path: str, requested_sheets=None):
+    wb = load_workbook(input_path)
+
+    sheet_names = list(wb.sheetnames)
+    results = []
+    skipped = []
+    processed_sheet_names = []
+
+    for sheet_name in sheet_names:
+        if sheet_name not in wb.sheetnames:
+            continue
+
+        ws = wb[sheet_name]
+
+        if requested_sheets is not None and sheet_name not in requested_sheets:
+            skipped.append((sheet_name, "not in SHEETS_TO_PROCESS"))
+            continue
+
+        if not should_process_sheet(ws):
+            skipped.append((sheet_name, "no formula/variable columns detected or skipped main sheet"))
+            continue
+
+        result = process_formula_sheet(wb, ws)
+
+        if result:
+            results.append(result)
+            processed_sheet_names.append(result["sheet_name"])
+        else:
+            skipped.append((sheet_name, "sheet skipped"))
+
+    consolidated_rows = 0
+
+    if processed_sheet_names:
+        consolidated_rows = rebuild_consolidated_all_sheet(wb, processed_sheet_names)
+
+    wb.save(output_path)
+
+    print(f"Input workbook : {input_path}")
+    print(f"Output workbook: {output_path}")
+    print("-" * 60)
+
+    if results:
+        print("Processed sheets:")
+        for item in results:
+            print(
+                f"  - {item['sheet_name']}  ->  {item['rm_input_sheet_name']} "
+                f"(rows={item['row_count']}, inputs={item['input_count']})"
+            )
+
+        print("-" * 60)
+        print(
+            f"Rebuilt '{CONSOLIDATED_SHEET_NAME}' with "
+            f"{consolidated_rows} rows. Duplicates preserved."
+        )
+
+    else:
+        print("No eligible formula sheets found.")
+
+    if skipped:
+        print("-" * 60)
+        print("Skipped sheets:")
+        for name, reason in skipped:
+            print(f"  - {name}: {reason}")
