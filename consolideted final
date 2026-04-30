@@ -1,6 +1,5 @@
 import re
 import argparse
-from pathlib import Path
 from collections import OrderedDict
 from openpyxl import load_workbook, Workbook
 from openpyxl.utils import get_column_letter
@@ -25,7 +24,7 @@ SUMMARY_SHEET = "RapidMiner_Conversion_Summary"
 
 
 # =========================================================
-# BASIC EXCEL HELPERS
+# EXCEL HELPERS
 # =========================================================
 def auto_fit_columns(ws, max_width=90):
     for col_cells in ws.columns:
@@ -71,12 +70,41 @@ def clean_text(value):
     return str(value).strip()
 
 
+def delete_sheet_if_exists(wb, sheet_name):
+    if sheet_name in wb.sheetnames:
+        del wb[sheet_name]
+
+
+def find_header_col(ws, possible_names):
+    targets = {str(x).strip().lower() for x in possible_names}
+
+    for c in range(1, ws.max_column + 1):
+        val = ws.cell(1, c).value
+        if val is None:
+            continue
+
+        if str(val).strip().lower() in targets:
+            return c
+
+    return None
+
+
+def get_or_create_col(ws, header_name):
+    for c in range(1, ws.max_column + 1):
+        if ws.cell(1, c).value == header_name:
+            return c
+
+    new_col = ws.max_column + 1
+    ws.cell(1, new_col).value = header_name
+    return new_col
+
+
 # =========================================================
-# STEP 1: PI AF FORMULA BREAKDOWN
+# STEP 1: PI AF SINGLE-CELL FORMULA BREAKDOWN
 # =========================================================
 def parse_analysis_rule_config(config_text):
     """
-    Rules:
+    AnalysisRuleConfigString rules:
     1. replace _x000D_ with ""
     2. replace ":= " with ":="
     3. split using ";"
@@ -111,13 +139,10 @@ def parse_analysis_rule_config(config_text):
 
 def parse_variable_mapping(mapping_text):
     """
-    Rules:
+    AnalysisRuleVariableMapping rules:
     1. split using ";"
     2. transpose
     3. split using " || "
-
-    Expected format generally:
-    variable || mapped_attribute
     """
 
     text = clean_text(mapping_text)
@@ -148,13 +173,11 @@ def find_mapping_for_variable(variable, mapping_dict):
     if variable in mapping_dict:
         return mapping_dict[variable]
 
-    # fallback without leading v
     if variable.startswith("v"):
         no_v = variable[1:]
         if no_v in mapping_dict:
             return mapping_dict[no_v]
 
-    # fallback with leading v
     with_v = "v" + variable
     if with_v in mapping_dict:
         return mapping_dict[with_v]
@@ -164,12 +187,12 @@ def find_mapping_for_variable(variable, mapping_dict):
 
 def find_source_columns(ws):
     """
-    Expected:
-    Column A = Name
+    Expected original workbook:
+    Column A = Name / Analysis Name
     Column B = AnalysisRuleConfigString
     Column C = AnalysisRuleVariableMapping
 
-    Also supports header-based detection.
+    Header detection is used first, then fallback to A/B/C.
     """
 
     headers = {
@@ -183,18 +206,23 @@ def find_source_columns(ws):
     mapping_col = None
 
     for key, col in headers.items():
-        if key in {"name", "analysis name", "analysis_name"}:
+        clean_key = key.replace(" ", "").replace("_", "")
+
+        if clean_key in {"name", "analysisname"}:
             name_col = col
-        elif key in {"analysisruleconfigstring", "analysis rule config string"}:
+
+        if clean_key == "analysisruleconfigstring":
             config_col = col
-        elif key in {"analysisrulevariablemapping", "analysis rule variable mapping"}:
+
+        if clean_key == "analysisrulevariablemapping":
             mapping_col = col
 
-    # fallback to A, B, C
     if name_col is None:
         name_col = 1
+
     if config_col is None:
         config_col = 2
+
     if mapping_col is None:
         mapping_col = 3
 
@@ -221,7 +249,6 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
 
     summary_rows = []
     consolidated_rows = []
-
     existing_sheet_names = set()
 
     for r in range(2, source_ws.max_row + 1):
@@ -232,7 +259,10 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
         if not analysis_name and not config_text and not mapping_text:
             continue
 
-        sheet_name = safe_sheet_name(analysis_name or f"Analysis_{r}", existing_sheet_names)
+        sheet_name = safe_sheet_name(
+            analysis_name or f"Analysis_{r}",
+            existing_sheet_names
+        )
         existing_sheet_names.add(sheet_name)
 
         formula_rows = parse_analysis_rule_config(config_text)
@@ -249,6 +279,9 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
 
         matched_count = 0
 
+        # IMPORTANT:
+        # No duplicate removal here.
+        # Every split formula row is preserved.
         for item in formula_rows:
             variable = item["Variable_Names"]
             formula = item["Formulas"]
@@ -279,7 +312,6 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
             matched_count
         ])
 
-    # Summary sheet
     summary_ws = out_wb.create_sheet("Summary", 0)
     summary_ws.append([
         "Source_Row",
@@ -295,7 +327,6 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
 
     auto_fit_columns(summary_ws)
 
-    # Consolidated sheet
     consolidated_ws = out_wb.create_sheet(CONSOLIDATED_SHEET)
     consolidated_ws.append([
         "Source_Row",
@@ -305,6 +336,9 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
         "Mapping_Attribute"
     ])
 
+    # IMPORTANT:
+    # Consolidated_All also preserves all rows.
+    # No duplicate removal is done.
     for row in consolidated_rows:
         consolidated_ws.append(row)
 
@@ -473,14 +507,33 @@ def make_input_alias(original_name: str) -> str:
     return "inp_" + sanitize_name(original_name)
 
 
-def transform_composite(expr: str, input_map: dict) -> str:
+def record_input(input_map: OrderedDict, input_events: list, original_name: str) -> str:
+    """
+    input_map keeps unique alias mapping internally.
+    input_events preserves every occurrence, including duplicates.
+    """
+
+    original_name = str(original_name).strip()
+
+    if original_name not in input_map:
+        input_map[original_name] = make_input_alias(original_name)
+
+    input_events.append({
+        "Original_Input_Name": original_name,
+        "RapidMiner_Input_Name": input_map[original_name]
+    })
+
+    return input_map[original_name]
+
+
+def transform_composite(expr: str, input_map: OrderedDict, input_events: list) -> str:
     out = []
     i = 0
 
     while i < len(expr):
         ch = expr[i]
 
-        # quoted PI reference
+        # Quoted PI/AF reference
         if ch == "'":
             j = i + 1
 
@@ -494,15 +547,13 @@ def transform_composite(expr: str, input_map: dict) -> str:
             if inner == "*":
                 out.append("'*'")
             else:
-                if inner not in input_map:
-                    input_map[inner] = make_input_alias(inner)
-
-                out.append(f"[{input_map[inner]}]")
+                rm_input_name = record_input(input_map, input_events, inner)
+                out.append(f"[{rm_input_name}]")
 
             i = j + 1
             continue
 
-        # word, variable, function
+        # Word / variable / function
         if ch.isalpha() or ch == "_":
             j = i + 1
 
@@ -515,17 +566,17 @@ def transform_composite(expr: str, input_map: dict) -> str:
             while k < len(expr) and expr[k].isspace():
                 k += 1
 
-            # function call
+            # Function call
             if k < len(expr) and expr[k] == "(":
                 end = find_matching_paren(expr, k)
 
                 if end != -1:
                     func_text = expr[i:end + 1]
-                    out.append(transform_expression(func_text, input_map))
+                    out.append(transform_expression(func_text, input_map, input_events))
                     i = end + 1
                     continue
 
-            # internal variable beginning with v
+            # Internal variable beginning with v
             if word.startswith("v") and len(word) > 1 and (word[1].isalpha() or word[1] == "_"):
                 out.append(f"[{word[1:]}]")
             else:
@@ -550,7 +601,7 @@ def transform_composite(expr: str, input_map: dict) -> str:
     return text
 
 
-def transform_expression(expr: str, input_map: dict) -> str:
+def transform_expression(expr: str, input_map: OrderedDict, input_events: list) -> str:
     expr = collapse_outer_parens(str(expr).strip())
 
     parsed_if = parse_if(expr)
@@ -559,9 +610,9 @@ def transform_expression(expr: str, input_map: dict) -> str:
         condition, true_part, false_part = parsed_if
 
         return (
-            f"if({transform_expression(condition, input_map)}, "
-            f"{transform_expression(true_part, input_map)}, "
-            f"{transform_expression(false_part, input_map)})"
+            f"if({transform_expression(condition, input_map, input_events)}, "
+            f"{transform_expression(true_part, input_map, input_events)}, "
+            f"{transform_expression(false_part, input_map, input_events)})"
         )
 
     func_match = re.match(
@@ -580,13 +631,13 @@ def transform_expression(expr: str, input_map: dict) -> str:
             fname_l = fname.lower()
 
             if fname_l == "median" and len(args) == 3:
-                lo = transform_expression(args[0], input_map)
-                val = transform_expression(args[1], input_map)
-                hi = transform_expression(args[2], input_map)
+                lo = transform_expression(args[0], input_map, input_events)
+                val = transform_expression(args[1], input_map, input_events)
+                hi = transform_expression(args[2], input_map, input_events)
                 return f"min(max({val}, {lo}), {hi})"
 
             if fname_l == "badval" and len(args) == 1:
-                return f"missing({transform_expression(args[0], input_map)})"
+                return f"missing({transform_expression(args[0], input_map, input_events)})"
 
             if fname_l == "nooutput" and len(args) == 0:
                 return NO_OUTPUT_TOKEN
@@ -597,21 +648,15 @@ def transform_expression(expr: str, input_map: dict) -> str:
 
                 if m:
                     prev_name = m.group(1) + "|Prev"
-
-                    if prev_name not in input_map:
-                        input_map[prev_name] = make_input_alias(prev_name)
-
-                    return f"[{input_map[prev_name]}]"
+                    rm_input_name = record_input(input_map, input_events, prev_name)
+                    return f"[{rm_input_name}]"
 
                 fallback_name = "PrevValue"
-
-                if fallback_name not in input_map:
-                    input_map[fallback_name] = make_input_alias(fallback_name)
-
-                return f"[{input_map[fallback_name]}]"
+                rm_input_name = record_input(input_map, input_events, fallback_name)
+                return f"[{rm_input_name}]"
 
             transformed_args = [
-                transform_expression(arg, input_map)
+                transform_expression(arg, input_map, input_events)
                 for arg in args
             ]
 
@@ -622,42 +667,20 @@ def transform_expression(expr: str, input_map: dict) -> str:
 
             return f"{generic_name}(" + ", ".join(transformed_args) + ")"
 
-    return transform_composite(expr, input_map)
+    return transform_composite(expr, input_map, input_events)
 
 
 # =========================================================
-# STEP 3: APPLY RAPIDMINER CONVERSION TO CONSOLIDATED SHEET
+# STEP 3: APPLY RAPIDMINER CONVERSION
 # =========================================================
-def find_header_col(ws, possible_names):
-    targets = {str(x).strip().lower() for x in possible_names}
-
-    for c in range(1, ws.max_column + 1):
-        val = ws.cell(1, c).value
-
-        if val is None:
-            continue
-
-        if str(val).strip().lower() in targets:
-            return c
-
-    return None
-
-
-def get_or_create_col(ws, header_name):
-    for c in range(1, ws.max_column + 1):
-        if ws.cell(1, c).value == header_name:
-            return c
-
-    new_col = ws.max_column + 1
-    ws.cell(1, new_col).value = header_name
-    return new_col
-
-
 def apply_rapidminer_conversion(wb):
     if CONSOLIDATED_SHEET not in wb.sheetnames:
         raise ValueError(f"'{CONSOLIDATED_SHEET}' sheet not found.")
 
     ws = wb[CONSOLIDATED_SHEET]
+
+    source_row_col = find_header_col(ws, ["Source_Row"])
+    analysis_col = find_header_col(ws, ["Analysis_Name"])
 
     var_col = find_header_col(ws, [
         "Variable_Names",
@@ -671,22 +694,36 @@ def apply_rapidminer_conversion(wb):
         "Formula"
     ])
 
+    mapping_col = find_header_col(ws, [
+        "Mapping_Attribute",
+        "Mapping Attribute",
+        "mapping_attribute"
+    ])
+
     if not var_col or not formula_col:
         raise ValueError("Could not find Variable_Names and Formulas columns.")
 
     rm_var_col = get_or_create_col(ws, "RapidMiner_Variable_Name")
     rm_formula_col = get_or_create_col(ws, "RapidMiner_Formula")
 
-    input_map = OrderedDict()
+    global_input_map = OrderedDict()
+    input_occurrences = []
     formula_count = 0
 
     for r in range(2, ws.max_row + 1):
+        source_row = ws.cell(r, source_row_col).value if source_row_col else r
+        analysis_name = ws.cell(r, analysis_col).value if analysis_col else ""
         var_value = ws.cell(r, var_col).value
         formula_value = ws.cell(r, formula_col).value
+        mapping_attr = ws.cell(r, mapping_col).value if mapping_col else ""
 
         if var_value is not None:
             var_name = str(var_value).strip()
-            ws.cell(r, rm_var_col).value = var_name[1:] if var_name.startswith("v") else var_name
+            rm_var_name = var_name[1:] if var_name.startswith("v") else var_name
+            ws.cell(r, rm_var_col).value = rm_var_name
+        else:
+            var_name = ""
+            rm_var_name = ""
 
         if formula_value is None:
             continue
@@ -694,29 +731,54 @@ def apply_rapidminer_conversion(wb):
         if isinstance(formula_value, (int, float)):
             ws.cell(r, rm_formula_col).value = formula_value
             formula_count += 1
-        else:
-            formula_text = str(formula_value).strip()
+            continue
 
-            if formula_text:
-                ws.cell(r, rm_formula_col).value = transform_expression(formula_text, input_map)
-                formula_count += 1
-            else:
-                ws.cell(r, rm_formula_col).value = ""
+        formula_text = str(formula_value).strip()
+
+        if not formula_text:
+            ws.cell(r, rm_formula_col).value = ""
+            continue
+
+        local_input_map = OrderedDict()
+        local_input_events = []
+
+        converted_formula = transform_expression(
+            formula_text,
+            local_input_map,
+            local_input_events
+        )
+
+        ws.cell(r, rm_formula_col).value = converted_formula
+        formula_count += 1
+
+        # Merge aliases into global unique map.
+        for original_input, rm_input in local_input_map.items():
+            if original_input not in global_input_map:
+                global_input_map[original_input] = rm_input
+
+        # IMPORTANT:
+        # No duplicate removal here.
+        # Every input occurrence is written with analysis mapping.
+        for event in local_input_events:
+            input_occurrences.append({
+                "Source_Row": source_row,
+                "Analysis_Name": analysis_name,
+                "Variable_Names": var_name,
+                "RapidMiner_Variable_Name": rm_var_name,
+                "Mapping_Attribute": mapping_attr,
+                "Original_Input_Name": event["Original_Input_Name"],
+                "RapidMiner_Input_Name": event["RapidMiner_Input_Name"]
+            })
 
     auto_fit_columns(ws)
 
-    return input_map, formula_count
+    return global_input_map, input_occurrences, formula_count
 
 
 # =========================================================
-# STEP 4: CREATE RAPIDMINER INPUT AND COMPILED SHEETS
+# STEP 4: CREATE RAPIDMINER INPUT SHEET WITH ANALYSIS MAPPING
 # =========================================================
-def delete_sheet_if_exists(wb, sheet_name):
-    if sheet_name in wb.sheetnames:
-        del wb[sheet_name]
-
-
-def create_rm_input_sheet(wb, input_map):
+def create_rm_input_sheet(wb, input_occurrences):
     input_sheet_name = CONSOLIDATED_SHEET[:31 - len(INPUT_SUFFIX)] + INPUT_SUFFIX
     input_sheet_name = input_sheet_name[:31]
 
@@ -726,16 +788,29 @@ def create_rm_input_sheet(wb, input_map):
     ws = wb.create_sheet(input_sheet_name, index=source_index + 1)
 
     ws.append([
+        "Source_Row",
+        "Analysis_Name",
+        "Variable_Names",
+        "RapidMiner_Variable_Name",
+        "Mapping_Attribute",
         "Original_Input_Name",
         "Value",
         "RapidMiner_Input_Name"
     ])
 
-    for original_name, rm_input_name in sorted(input_map.items(), key=lambda x: x[0].lower()):
+    # IMPORTANT:
+    # No duplicate removal.
+    # Same input can appear multiple times for different formulas/analyses.
+    for item in input_occurrences:
         ws.append([
-            original_name,
+            item.get("Source_Row", ""),
+            item.get("Analysis_Name", ""),
+            item.get("Variable_Names", ""),
+            item.get("RapidMiner_Variable_Name", ""),
+            item.get("Mapping_Attribute", ""),
+            item.get("Original_Input_Name", ""),
             None,
-            rm_input_name
+            item.get("RapidMiner_Input_Name", "")
         ])
 
     auto_fit_columns(ws)
@@ -743,6 +818,9 @@ def create_rm_input_sheet(wb, input_map):
     return input_sheet_name
 
 
+# =========================================================
+# STEP 5: CREATE COMPILED FORMULA AND INPUT SHEETS
+# =========================================================
 def create_compiled_sheets(wb):
     delete_sheet_if_exists(wb, COMPILED_FORMULA_SHEET)
     delete_sheet_if_exists(wb, COMPILED_INPUT_SHEET)
@@ -750,7 +828,6 @@ def create_compiled_sheets(wb):
     formula_rows = []
     input_map = OrderedDict()
 
-    # Compile formulas
     ws = wb[CONSOLIDATED_SHEET]
 
     rm_name_col = find_header_col(ws, ["RapidMiner_Variable_Name"])
@@ -764,10 +841,10 @@ def create_compiled_sheets(wb):
             rm_name = None if rm_name is None else str(rm_name).strip()
             rm_formula = None if rm_formula is None else str(rm_formula).strip()
 
+            # Formula rows are preserved as present in Consolidated_All.
             if rm_name and rm_formula:
                 formula_rows.append((rm_name, rm_formula))
 
-    # Compile inputs
     for sheet_name in wb.sheetnames:
         if sheet_name.endswith(INPUT_SUFFIX):
             input_ws = wb[sheet_name]
@@ -784,6 +861,7 @@ def create_compiled_sheets(wb):
                     rm_input_name = None if rm_input_name is None else str(rm_input_name).strip()
 
                     if original_name and rm_input_name:
+                        # Compiled_Inputs remains a unique master list.
                         if original_name not in input_map:
                             input_map[original_name] = rm_input_name
 
@@ -817,19 +895,31 @@ def create_compiled_sheets(wb):
     return len(formula_rows), len(input_map)
 
 
-def create_conversion_summary(wb, formula_count, input_count):
+# =========================================================
+# STEP 6: SUMMARY SHEET
+# =========================================================
+def create_conversion_summary(
+    wb,
+    formula_count,
+    unique_input_count,
+    input_occurrence_count
+):
     delete_sheet_if_exists(wb, SUMMARY_SHEET)
 
     ws = wb.create_sheet(SUMMARY_SHEET)
 
     ws.append(["Item", "Value"])
     ws.append(["Total RapidMiner formulas processed", formula_count])
-    ws.append(["Total unique RapidMiner inputs", input_count])
+    ws.append(["Total RapidMiner input occurrences", input_occurrence_count])
+    ws.append(["Total unique RapidMiner inputs", unique_input_count])
     ws.append(["Formula source sheet", CONSOLIDATED_SHEET])
+    ws.append(["Input mapping sheet", CONSOLIDATED_SHEET[:31 - len(INPUT_SUFFIX)] + INPUT_SUFFIX])
     ws.append(["Compiled formulas sheet", COMPILED_FORMULA_SHEET])
     ws.append(["Compiled inputs sheet", COMPILED_INPUT_SHEET])
+    ws.append(["Duplicate removal in Consolidated_All", "No"])
+    ws.append(["Duplicate removal in Consolidated_All_RM_input", "No"])
+    ws.append(["Duplicate removal in Compiled_Inputs", "Yes, unique master list only"])
 
-    # simple error scan
     error_tokens = ["#REF!", "#VALUE!", "#NAME?", "#N/A", "#DIV/0!"]
     error_found = []
 
@@ -858,28 +948,30 @@ def run_pipeline(input_file, output_file, source_sheet=None):
     wb = breakdown_pi_af_workbook(input_file, source_sheet)
 
     print("Step 2: Applying RapidMiner conversion on Consolidated_All...")
-    input_map, formula_count = apply_rapidminer_conversion(wb)
+    global_input_map, input_occurrences, formula_count = apply_rapidminer_conversion(wb)
 
-    print("Step 3: Creating RapidMiner input sheet...")
-    create_rm_input_sheet(wb, input_map)
+    print("Step 3: Creating Consolidated_All_RM_input with Analysis_Name mapping...")
+    create_rm_input_sheet(wb, input_occurrences)
 
     print("Step 4: Creating compiled formula/input sheets...")
-    compiled_formula_count, compiled_input_count = create_compiled_sheets(wb)
+    compiled_formula_count, compiled_unique_input_count = create_compiled_sheets(wb)
 
     print("Step 5: Creating summary sheet...")
     create_conversion_summary(
-        wb,
-        compiled_formula_count,
-        compiled_input_count
+        wb=wb,
+        formula_count=compiled_formula_count,
+        unique_input_count=compiled_unique_input_count,
+        input_occurrence_count=len(input_occurrences)
     )
 
     wb.save(output_file)
 
     print("-" * 70)
-    print(f"Input file  : {input_file}")
-    print(f"Output file : {output_file}")
-    print(f"Formulas    : {compiled_formula_count}")
-    print(f"Inputs      : {compiled_input_count}")
+    print(f"Input file                  : {input_file}")
+    print(f"Output file                 : {output_file}")
+    print(f"RapidMiner formulas          : {compiled_formula_count}")
+    print(f"RM input occurrences         : {len(input_occurrences)}")
+    print(f"Unique RM inputs             : {compiled_unique_input_count}")
     print("Done.")
 
 
