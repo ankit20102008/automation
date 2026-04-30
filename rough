@@ -1,0 +1,10 @@
+transform_composite
+text = re.sub(r"(?i)\bAND\b", "and", text)
+text = re.sub(r"(?i)\bOR\b", "or", text)
+text = re.sub(r"(?i)\bNOT\b", "not", text)
+
+# RapidMiner logical operators
+text = re.sub(r"(?i)\bAND\b", " && ", text)
+text = re.sub(r"(?i)\bOR\b", " || ", text)
+text = re.sub(r"(?i)\bNOT\b", " ! ", text)
+
