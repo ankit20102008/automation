@@ -14,7 +14,7 @@ OUTPUT_FILE = "pi_af_analysis_rapidminer_final.xlsx"
 # Keep None to use first sheet from input workbook
 SOURCE_SHEET = None
 
-NO_OUTPUT_TOKEN = "MISSING NUMERIC"
+NO_OUTPUT_TOKEN = "MISSING_NUMERIC"
 INPUT_SUFFIX = "_RM_input"
 
 CONSOLIDATED_SHEET = "Consolidated_All"
@@ -279,9 +279,7 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
 
         matched_count = 0
 
-        # IMPORTANT:
         # No duplicate removal here.
-        # Every split formula row is preserved.
         for item in formula_rows:
             variable = item["Variable_Names"]
             formula = item["Formulas"]
@@ -336,9 +334,7 @@ def breakdown_pi_af_workbook(input_file, source_sheet=None):
         "Mapping_Attribute"
     ])
 
-    # IMPORTANT:
-    # Consolidated_All also preserves all rows.
-    # No duplicate removal is done.
+    # Consolidated_All preserves all rows.
     for row in consolidated_rows:
         consolidated_ws.append(row)
 
@@ -426,13 +422,21 @@ def split_top_level_args(text: str):
     return args
 
 
-def find_top_level_keyword(text: str, keyword: str) -> int:
-    depth = 0
-    in_quote = False
-    kw = keyword.lower()
+def top_level_word_tokens(text: str):
+    """
+    Yields top-level word tokens outside quotes and parentheses.
+
+    Used for robust PI AF:
+    If condition Then true_value Else false_value
+
+    This helps avoid incorrectly picking nested Then/Else.
+    """
 
     i = 0
-    while i <= len(text) - len(keyword):
+    depth = 0
+    in_quote = False
+
+    while i < len(text):
         ch = text[i]
 
         if ch == "'" and (i == 0 or text[i - 1] != "\\"):
@@ -443,42 +447,101 @@ def find_top_level_keyword(text: str, keyword: str) -> int:
         if not in_quote:
             if ch == "(":
                 depth += 1
-            elif ch == ")":
-                depth -= 1
+                i += 1
+                continue
 
-            if depth == 0 and text[i:i + len(keyword)].lower() == kw:
-                prev = text[i - 1] if i > 0 else " "
-                nxt = text[i + len(keyword)] if i + len(keyword) < len(text) else " "
+            if ch == ")":
+                depth = max(0, depth - 1)
+                i += 1
+                continue
 
-                if not (prev.isalnum() or prev == "_") and not (nxt.isalnum() or nxt == "_"):
-                    return i
+            if depth == 0 and (ch.isalpha() or ch == "_"):
+                j = i + 1
+                while j < len(text) and (text[j].isalnum() or text[j] == "_"):
+                    j += 1
+
+                word = text[i:j]
+                yield word.lower(), i, j
+                i = j
+                continue
 
         i += 1
+
+
+def find_outer_then(rest: str):
+    """
+    Find Then belonging to the current outer If.
+    Handles nested IF inside condition.
+    """
+
+    nested_if = 0
+
+    for word, start, end in top_level_word_tokens(rest):
+        if word == "if":
+            nested_if += 1
+        elif word == "then":
+            if nested_if == 0:
+                return start
+        elif word == "else":
+            if nested_if > 0:
+                nested_if -= 1
+
+    return -1
+
+
+def find_outer_else(after_then: str):
+    """
+    Find Else belonging to the current outer If.
+    Handles nested IF inside true branch.
+    """
+
+    nested_if = 0
+
+    for word, start, end in top_level_word_tokens(after_then):
+        if word == "if":
+            nested_if += 1
+        elif word == "else":
+            if nested_if == 0:
+                return start
+            nested_if -= 1
 
     return -1
 
 
 def parse_if(expr: str):
-    expr = expr.strip()
+    """
+    Converts full PI AF IF expression:
 
-    if expr[:2].lower() != "if":
+    If condition Then true_value Else false_value
+
+    Returns:
+    condition, true_part, false_part
+
+    Handles nested IF so final RapidMiner output becomes:
+    if(condition, true_value, false_value)
+    """
+
+    expr = str(expr).strip()
+
+    m = re.match(r"(?i)^if\b", expr)
+    if not m:
         return None
 
-    rest = expr[2:].lstrip()
+    rest = expr[m.end():].strip()
 
-    then_idx = find_top_level_keyword(rest, "Then")
+    then_idx = find_outer_then(rest)
     if then_idx == -1:
         return None
 
     condition = rest[:then_idx].strip()
-    rest_after_then = rest[then_idx + 4:].lstrip()
+    after_then = rest[then_idx + len("Then"):].strip()
 
-    else_idx = find_top_level_keyword(rest_after_then, "Else")
+    else_idx = find_outer_else(after_then)
     if else_idx == -1:
         return None
 
-    true_part = rest_after_then[:else_idx].strip()
-    false_part = rest_after_then[else_idx + 4:].strip()
+    true_part = after_then[:else_idx].strip()
+    false_part = after_then[else_idx + len("Else"):].strip()
 
     return condition, true_part, false_part
 
@@ -576,7 +639,7 @@ def transform_composite(expr: str, input_map: OrderedDict, input_events: list) -
                     i = end + 1
                     continue
 
-            # Internal variable beginning with v
+            # Internal PI AF variable beginning with v
             if word.startswith("v") and len(word) > 1 and (word[1].isalpha() or word[1] == "_"):
                 out.append(f"[{word[1:]}]")
             else:
@@ -590,12 +653,17 @@ def transform_composite(expr: str, input_map: OrderedDict, input_events: list) -
 
     text = "".join(out)
 
-    text = re.sub(r"(?i)\bAND\b", "and", text)
-    text = re.sub(r"(?i)\bOR\b", "or", text)
-    text = re.sub(r"(?i)\bNOT\b", "not", text)
+    # RapidMiner logical operators
+    text = re.sub(r"(?i)\bAND\b", " && ", text)
+    text = re.sub(r"(?i)\bOR\b", " || ", text)
+    text = re.sub(r"(?i)\bNOT\b", " ! ", text)
 
+    # PI AF not equal
     text = text.replace("<>", "!=")
+
+    # Convert single = to RapidMiner equality ==
     text = re.sub(r"(?<![<>=!])=(?!=)", "==", text)
+
     text = re.sub(r"\s+", " ", text).strip()
 
     return text
@@ -604,16 +672,23 @@ def transform_composite(expr: str, input_map: OrderedDict, input_events: list) -
 def transform_expression(expr: str, input_map: OrderedDict, input_events: list) -> str:
     expr = collapse_outer_parens(str(expr).strip())
 
+    # -----------------------------------------------------
+    # PI AF IF:
+    # If condition Then true_value Else false_value
+    #
+    # RapidMiner IF:
+    # if(condition, true_value, false_value)
+    # -----------------------------------------------------
     parsed_if = parse_if(expr)
 
     if parsed_if:
         condition, true_part, false_part = parsed_if
 
-        return (
-            f"if({transform_expression(condition, input_map, input_events)}, "
-            f"{transform_expression(true_part, input_map, input_events)}, "
-            f"{transform_expression(false_part, input_map, input_events)})"
-        )
+        condition_rm = transform_expression(condition, input_map, input_events)
+        true_rm = transform_expression(true_part, input_map, input_events)
+        false_rm = transform_expression(false_part, input_map, input_events)
+
+        return f"if({condition_rm}, {true_rm}, {false_rm})"
 
     func_match = re.match(
         r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$",
@@ -642,6 +717,22 @@ def transform_expression(expr: str, input_map: OrderedDict, input_events: list) 
             if fname_l == "nooutput" and len(args) == 0:
                 return NO_OUTPUT_TOKEN
 
+            # RapidMiner does not support Avg() directly.
+            # Convert Avg(a, b, c) into ((a + b + c) / 3)
+            if fname_l in {"avg", "average"}:
+                if len(args) == 0:
+                    return NO_OUTPUT_TOKEN
+
+                transformed_args = [
+                    transform_expression(arg, input_map, input_events)
+                    for arg in args
+                ]
+
+                if len(transformed_args) == 1:
+                    return transformed_args[0]
+
+                return "((" + " + ".join(transformed_args) + f") / {len(transformed_args)})"
+
             if fname_l == "prevval" and len(args) >= 1:
                 first_arg = args[0].strip()
                 m = re.fullmatch(r"'([^']*)'", first_arg)
@@ -668,6 +759,24 @@ def transform_expression(expr: str, input_map: OrderedDict, input_events: list) 
             return f"{generic_name}(" + ", ".join(transformed_args) + ")"
 
     return transform_composite(expr, input_map, input_events)
+
+
+def cleanup_rapidminer_if(formula: str) -> str:
+    """
+    Final safety cleanup:
+    - RapidMiner IF must be if(condition, true_value, false_value).
+    - If any Then/Else escaped conversion, mark the row clearly.
+    """
+
+    if formula is None:
+        return ""
+
+    text = str(formula).strip()
+
+    if re.search(r"(?i)\bThen\b|\bElse\b", text):
+        text = "CHECK_IF_CONVERSION__" + text
+
+    return text
 
 
 # =========================================================
@@ -748,6 +857,8 @@ def apply_rapidminer_conversion(wb):
             local_input_events
         )
 
+        converted_formula = cleanup_rapidminer_if(converted_formula)
+
         ws.cell(r, rm_formula_col).value = converted_formula
         formula_count += 1
 
@@ -756,7 +867,6 @@ def apply_rapidminer_conversion(wb):
             if original_input not in global_input_map:
                 global_input_map[original_input] = rm_input
 
-        # IMPORTANT:
         # No duplicate removal here.
         # Every input occurrence is written with analysis mapping.
         for event in local_input_events:
@@ -798,7 +908,6 @@ def create_rm_input_sheet(wb, input_occurrences):
         "RapidMiner_Input_Name"
     ])
 
-    # IMPORTANT:
     # No duplicate removal.
     # Same input can appear multiple times for different formulas/analyses.
     for item in input_occurrences:
@@ -861,7 +970,7 @@ def create_compiled_sheets(wb):
                     rm_input_name = None if rm_input_name is None else str(rm_input_name).strip()
 
                     if original_name and rm_input_name:
-                        # Compiled_Inputs remains a unique master list.
+                        # Compiled_Inputs remains unique master input list.
                         if original_name not in input_map:
                             input_map[original_name] = rm_input_name
 
@@ -919,9 +1028,14 @@ def create_conversion_summary(
     ws.append(["Duplicate removal in Consolidated_All", "No"])
     ws.append(["Duplicate removal in Consolidated_All_RM_input", "No"])
     ws.append(["Duplicate removal in Compiled_Inputs", "Yes, unique master list only"])
+    ws.append(["RapidMiner AND operator", "&&"])
+    ws.append(["RapidMiner OR operator", "||"])
+    ws.append(["RapidMiner missing numeric token", NO_OUTPUT_TOKEN])
+    ws.append(["RapidMiner IF format", "if(condition, true_value, false_value)"])
 
     error_tokens = ["#REF!", "#VALUE!", "#NAME?", "#N/A", "#DIV/0!"]
     error_found = []
+    if_check_rows = []
 
     for sheet in wb.worksheets:
         for row in sheet.iter_rows():
@@ -931,11 +1045,20 @@ def create_conversion_summary(
                         if token in cell.value:
                             error_found.append((sheet.title, cell.coordinate, token))
 
+                    if cell.value.startswith("CHECK_IF_CONVERSION__"):
+                        if_check_rows.append((sheet.title, cell.coordinate))
+
     ws.append([])
     ws.append(["Excel error strings found", len(error_found)])
 
     for sheet_name, cell_ref, token in error_found:
         ws.append([sheet_name, f"{cell_ref}: {token}"])
+
+    ws.append([])
+    ws.append(["IF conversion check rows found", len(if_check_rows)])
+
+    for sheet_name, cell_ref in if_check_rows:
+        ws.append([sheet_name, cell_ref])
 
     auto_fit_columns(ws)
 
