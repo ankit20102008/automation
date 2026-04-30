@@ -21,3 +21,11 @@ if fname_l in {"avg", "average"}:
         return transformed_args[0]
 
     return "((" + " + ".join(transformed_args) + f") / {len(transformed_args)})"
+
+CONSOLIDATED_SHEET_NAME = "consolidated_all"
+ANALYSIS_NAME_COL = "Analysis_Name"
+
+SKIP_MAIN_SHEETS = {
+    "summary",
+    "consolidated_all"
+}
