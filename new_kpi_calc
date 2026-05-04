@@ -1,0 +1,1450 @@
+#!/usr/bin/env python3
+"""
+PI AF / OSIsoft PI Analysis Excel export -> RapidMiner-ready workbook.
+
+Usage from command prompt:
+  python pi_af_full_pipeline_jupyter_updated.py --input sample_analysis.xlsx --output pi_af_analysis_rapidminer_final.xlsx
+  python pi_af_full_pipeline_jupyter_updated.py --input sample_analysis.xlsx --output pi_af_analysis_rapidminer_final.xlsx --sheet Sheet1
+  python pi_af_full_pipeline_jupyter_updated.py --input sample_analysis.xlsx --output final.xlsx --tagval-base-minutes 15
+
+Usage from Jupyter Notebook:
+  1. Put this whole script in one cell, or open it as a notebook/script.
+  2. Update JUPYTER_INPUT_FILE, JUPYTER_OUTPUT_FILE, and JUPYTER_SHEET_NAME below.
+  3. Run the cell.
+
+Input workbook expected columns:
+  Column A / header Name                         = Analysis name
+  Column B / header AnalysisRuleConfigString     = PI AF calculation string
+  Column C / header AnalysisRuleVariableMapping  = PI AF output variable mapping
+
+The script uses openpyxl only, preserves duplicate formula rows, and creates
+RapidMiner-ready formula/input sheets.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+
+EXCEL_ERROR_STRINGS = ["#REF!", "#VALUE!", "#NAME?", "#N/A", "#DIV/0!"]
+KNOWN_INPUT_SUFFIXES = ["Lo", "Hi", "DF", "DS", "Prev"]
+CHECK_PREFIX = "CHECK_IF_CONVERSION__"
+CHECK_TAGVAL_PREFIX = "CHECK_TAGVAL_CONVERSION__"
+CHECK_TAGVAL_INTERVAL_PREFIX = "CHECK_TAGVAL_INTERVAL__"
+
+
+
+# ---------------------------------------------------------------------------
+# JUPYTER NOTEBOOK INPUT / OUTPUT SETTINGS
+# ---------------------------------------------------------------------------
+# Edit only these values when running inside Jupyter Notebook.
+# Use raw strings r"..." for Windows paths.
+# Examples:
+#   JUPYTER_INPUT_FILE = r"D:\Your_Folder\sample_analysis.xlsx"
+#   JUPYTER_OUTPUT_FILE = r"D:\Your_Folder\pi_af_analysis_rapidminer_final.xlsx"
+#   JUPYTER_SHEET_NAME = None      # use first sheet
+#   JUPYTER_SHEET_NAME = "Sheet1"  # use specific sheet
+
+JUPYTER_INPUT_FILE = r"sample_analysis_rev1.xlsx"
+JUPYTER_OUTPUT_FILE = r"sample_analysis_RM_rev2.xlsx"
+JUPYTER_SHEET_NAME: Optional[str] = None
+
+# PI AF TagVal(tag, '*-1h') is time-based. RapidMiner lag() is row/sample-based.
+# Set this to your dataset sampling interval. Examples:
+#   60  -> hourly data:     TagVal(tag, '*-1h') becomes lag([inp_tag], 1)
+#   15  -> 15-minute data:  TagVal(tag, '*-1h') becomes lag([inp_tag], 4)
+JUPYTER_TAGVAL_BASE_INTERVAL_MINUTES: float = 60.0
+
+# If this script is executed inside Jupyter, this flag controls whether it runs
+# automatically using the Jupyter variables above.
+RUN_AUTOMATICALLY_IN_JUPYTER = True
+
+
+@dataclass
+class InputOccurrence:
+    """One RapidMiner input occurrence extracted from one formula row."""
+
+    original_input_name: str
+    value: str
+    rapidminer_input_name: str
+
+
+@dataclass
+class FormulaRow:
+    """One parsed formula row from one PI AF analysis."""
+
+    source_row: int
+    analysis_name: str
+    variable_names: str
+    formulas: str
+    mapping_attribute: str = ""
+    rapidminer_variable_name: str = ""
+    rapidminer_formula: str = ""
+    input_occurrences: List[InputOccurrence] = field(default_factory=list)
+
+
+@dataclass
+class AnalysisSummary:
+    """Summary information for one source workbook analysis row."""
+
+    analysis_name: str
+    output_sheet_name: str
+    formula_count: int
+    mapping_count: int
+    matched_mapping_count: int
+
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+
+def s(value) -> str:
+    """Return a clean string for blank-safe processing."""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def normalize_header(text: str) -> str:
+    """Normalize headers so minor case/spelling/space differences do not break detection."""
+    return re.sub(r"[^a-z0-9]", "", s(text).strip().lower())
+
+
+def find_input_columns(ws) -> Tuple[int, int, int]:
+    """
+    Detect input columns by header name. Falls back to A/B/C if needed.
+
+    Handles headers like:
+      Name
+      AnalysisRuleConfigString
+      AnalysisRuleVariableMapping
+    and case variants such as AnalysisRUleVariableMapping.
+    """
+    header_to_col: Dict[str, int] = {}
+    for cell in ws[1]:
+        header_to_col[normalize_header(cell.value)] = cell.column
+
+    name_col = header_to_col.get("name", 1)
+    formula_col = header_to_col.get("analysisruleconfigstring", 2)
+    mapping_col = header_to_col.get("analysisrulevariablemapping", 3)
+    return name_col, formula_col, mapping_col
+
+
+def clean_config_string(text: str) -> str:
+    """Apply required cleaning before splitting PI AF config strings."""
+    text = s(text).replace("_x000D_", "")
+    text = text.replace(":= ", ":=")
+    return text.strip()
+
+
+def sanitize_name(name: str, default: str = "Name") -> str:
+    """
+    Sanitize a PI tag/variable name into a RapidMiner-safe attribute name part.
+
+    - trims leading/trailing blanks
+    - replaces invalid characters with underscores
+    - collapses repeated underscores
+    - avoids blank names and leading digits
+    """
+    name = s(name).strip()
+    name = re.sub(r"[^A-Za-z0-9_]+", "_", name)
+    name = re.sub(r"_+", "_", name).strip("_")
+    if not name:
+        name = default
+    if re.match(r"^\d", name):
+        name = "_" + name
+    return name
+
+
+def split_known_suffix(input_name: str, forced_suffix: str = "") -> Tuple[str, str]:
+    """
+    Split known PI input suffixes from a tag name.
+
+    Examples:
+      ABC|Lo   -> (ABC, Lo)
+      ABC|Hi   -> (ABC, Hi)
+      PrevVal('ABC') is handled by forced_suffix='Prev' -> (ABC, Prev)
+    """
+    clean = s(input_name).strip()
+    if forced_suffix:
+        return clean, forced_suffix
+
+    for suffix in KNOWN_INPUT_SUFFIXES:
+        marker = "|" + suffix
+        if clean.endswith(marker):
+            return clean[: -len(marker)].strip(), suffix
+    return clean, ""
+
+
+def rapidminer_input_name(input_name: str, forced_suffix: str = "") -> Tuple[str, str, str]:
+    """
+    Build RapidMiner input name and return:
+      (original_base_name, suffix_value, rapidminer_name_without_brackets)
+    """
+    base, suffix = split_known_suffix(input_name, forced_suffix=forced_suffix)
+    base_part = sanitize_name(base, default="Input")
+    if suffix:
+        return base, suffix, f"inp_{base_part}_{sanitize_name(suffix, default='Value')}"
+    return base, "", f"inp_{base_part}"
+
+
+def rapidminer_output_name(variable_name: str) -> str:
+    """
+    Convert PI AF internal variable/output names to RapidMiner output names.
+
+    Per requirement: variables starting with v remove the leading v.
+    Only one leading v/V is removed intentionally. Example:
+      vABC  -> ABC
+      vvABC -> vABC
+    """
+    var = s(variable_name).strip()
+    if len(var) > 1 and var[0].lower() == "v":
+        var = var[1:]
+    return sanitize_name(var, default="Output")
+
+
+def safe_excel_value(value):
+    """Write formula-like text literally, not as an Excel formula."""
+    if isinstance(value, str) and value.startswith("="):
+        return "'" + value
+    return value
+
+
+def shorten(text: str, limit: int = 300) -> str:
+    text = s(text)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+# ---------------------------------------------------------------------------
+# PI AF config parsing
+# ---------------------------------------------------------------------------
+
+
+def parse_formula_config(config_string: str) -> List[Tuple[str, str]]:
+    """
+    Split AnalysisRuleConfigString into (Variable_Names, Formulas) rows.
+
+    Required behavior:
+      1. Replace _x000D_ with blank.
+      2. Replace ':= ' with ':='.
+      3. Split using semicolon.
+      4. Split each formula row using ':='.
+    """
+    cleaned = clean_config_string(config_string)
+    rows: List[Tuple[str, str]] = []
+
+    for part in cleaned.split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        if ":=" in item:
+            variable, formula = item.split(":=", 1)
+            rows.append((variable.strip(), formula.strip()))
+        else:
+            # Keep malformed/partial formula rows instead of silently dropping them.
+            rows.append(("", item.strip()))
+    return rows
+
+
+def parse_variable_mapping(mapping_string: str) -> List[Tuple[str, str]]:
+    """
+    Split AnalysisRuleVariableMapping into (Variable_Names, Mapping_Attribute) rows.
+
+    Required behavior:
+      1. Split using semicolon.
+      2. Split using ' || ' / '||'.
+      3. Preserve Mapping_Attribute.
+    """
+    cleaned = clean_config_string(mapping_string)
+    rows: List[Tuple[str, str]] = []
+
+    for part in cleaned.split(";"):
+        item = part.strip()
+        if not item:
+            continue
+        if "||" in item:
+            variable, attribute = item.split("||", 1)
+            rows.append((variable.strip(), attribute.strip()))
+        else:
+            rows.append((item.strip(), ""))
+    return rows
+
+
+def mapping_lookup(mapping_rows: Sequence[Tuple[str, str]]) -> Dict[str, str]:
+    """
+    Create a mapping dictionary with exact and normalized keys.
+
+    This improves join robustness if the source uses whitespace or v-prefix variants.
+    """
+    lookup: Dict[str, str] = {}
+    for variable, attribute in mapping_rows:
+        if not variable:
+            continue
+        keys = {
+            variable.strip(),
+            normalize_key(variable),
+            rapidminer_output_name(variable),
+        }
+        for key in keys:
+            if key and key not in lookup:
+                lookup[key] = attribute
+    return lookup
+
+
+def normalize_key(name: str) -> str:
+    return sanitize_name(s(name).strip(), default="Name").lower()
+
+
+def find_mapping_for_variable(variable: str, lookup: Dict[str, str]) -> str:
+    """Find Mapping_Attribute for a formula variable."""
+    possible = [
+        variable.strip(),
+        normalize_key(variable),
+        rapidminer_output_name(variable),
+    ]
+    for key in possible:
+        if key in lookup:
+            return lookup[key]
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Formula conversion helpers
+# ---------------------------------------------------------------------------
+
+
+def replace_prevval_calls(expr: str, occurrences: List[InputOccurrence]) -> str:
+    """Convert PrevVal('ABC') to [inp_ABC_Prev] and record an input occurrence."""
+
+    def repl(match: re.Match) -> str:
+        quote = match.group(1)
+        input_name = match.group(2).strip()
+        original, value, rm_name = rapidminer_input_name(input_name, forced_suffix="Prev")
+        occurrences.append(InputOccurrence(original, value, rm_name))
+        return f"[{rm_name}]"
+
+    # Supports PrevVal('ABC') and PrevVal("ABC") conservatively.
+    pattern = re.compile(r"\bPrevVal\s*\(\s*(['\"])(.*?)\1\s*\)", flags=re.IGNORECASE | re.DOTALL)
+    return pattern.sub(repl, expr)
+
+
+def replace_quoted_pi_tags(expr: str, occurrences: List[InputOccurrence]) -> str:
+    """Convert single-quoted PI tag references to RapidMiner [inp_*] references."""
+
+    def repl(match: re.Match) -> str:
+        raw_name = match.group(1).strip()
+        original, value, rm_name = rapidminer_input_name(raw_name)
+        occurrences.append(InputOccurrence(original, value, rm_name))
+        return f"[{rm_name}]"
+
+    return re.sub(r"'([^']*)'", repl, expr)
+
+
+def split_top_level_args(arg_text: str) -> List[str]:
+    """Split function argument text on top-level commas only.
+
+    Protects commas inside:
+      - parentheses
+      - [RapidMiner attributes]
+      - single-quoted PI strings
+      - double-quoted strings
+    """
+    args: List[str] = []
+    start = 0
+    paren = 0
+    bracket = 0
+    in_single = False
+    in_double = False
+    escape = False
+
+    for i, ch in enumerate(arg_text):
+        if in_single:
+            # PI AF single-quoted tag names usually escape a quote as two single quotes.
+            if ch == "'":
+                if i + 1 < len(arg_text) and arg_text[i + 1] == "'":
+                    continue
+                in_single = False
+            continue
+
+        if in_double:
+            if ch == "\\" and not escape:
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_double = False
+            escape = False
+            continue
+
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch == "[":
+            bracket += 1
+            continue
+        if ch == "]" and bracket > 0:
+            bracket -= 1
+            continue
+        if bracket:
+            continue
+        if ch == "(":
+            paren += 1
+        elif ch == ")" and paren > 0:
+            paren -= 1
+        elif ch == "," and paren == 0:
+            args.append(arg_text[start:i].strip())
+            start = i + 1
+
+    last = arg_text[start:].strip()
+    if last:
+        args.append(last)
+    elif arg_text.strip() == "":
+        return []
+    else:
+        args.append("")
+    return args
+
+def find_matching_paren(expr: str, open_idx: int) -> int:
+    """Return index of the matching closing parenthesis or -1."""
+    depth = 0
+    bracket = 0
+    in_single = False
+    in_double = False
+    escape = False
+
+    for i in range(open_idx, len(expr)):
+        ch = expr[i]
+
+        if in_single:
+            if ch == "'":
+                if i + 1 < len(expr) and expr[i + 1] == "'":
+                    continue
+                in_single = False
+            continue
+
+        if in_double:
+            if ch == "\\" and not escape:
+                escape = True
+                continue
+            if ch == '"' and not escape:
+                in_double = False
+            escape = False
+            continue
+
+        if ch == "'":
+            in_single = True
+            continue
+        if ch == '"':
+            in_double = True
+            continue
+        if ch == "[":
+            bracket += 1
+            continue
+        if ch == "]" and bracket > 0:
+            bracket -= 1
+            continue
+        if bracket:
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+def replace_function_calls(expr: str, function_names: Sequence[str], converter) -> str:
+    """
+    Replace simple function calls by scanning matching parentheses.
+
+    converter receives a list of top-level argument strings and must return replacement text.
+    """
+    names = sorted(function_names, key=len, reverse=True)
+    pattern = re.compile(r"\b(" + "|".join(re.escape(n) for n in names) + r")\s*\(", flags=re.IGNORECASE)
+
+    pos = 0
+    out = []
+    while True:
+        match = pattern.search(expr, pos)
+        if not match:
+            out.append(expr[pos:])
+            break
+
+        open_idx = expr.find("(", match.start())
+        close_idx = find_matching_paren(expr, open_idx)
+        if close_idx == -1:
+            out.append(expr[pos:])
+            break
+
+        out.append(expr[pos: match.start()])
+        arg_text = expr[open_idx + 1: close_idx]
+        args = split_top_level_args(arg_text)
+        out.append(converter(args, match.group(1)))
+        pos = close_idx + 1
+
+    return "".join(out)
+
+
+def strip_outer_quotes(text: str) -> str:
+    """Remove one pair of matching single/double quotes from a function argument."""
+    text = s(text).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
+        return text[1:-1].strip()
+    return text
+
+
+def parse_pi_time_offset_minutes(time_text: str) -> Optional[float]:
+    """
+    Parse common PI relative time expressions into minutes.
+
+    Supported examples:
+      '*-1h'   -> -60
+      '* - 15m'-> -15
+      '*-30s'  -> -0.5
+      '*-1d'   -> -1440
+      '*+1h'   -> +60, but TagVal conversion will mark it for manual review
+
+    Returns None if the expression is not a simple relative offset from '*'.
+    """
+    text = strip_outer_quotes(time_text).strip().replace(" ", "")
+    if text == "*":
+        return 0.0
+
+    match = re.fullmatch(r"\*([+-])(\d+(?:\.\d+)?)([smhdw])", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    sign = -1.0 if match.group(1) == "-" else 1.0
+    amount = float(match.group(2))
+    unit = match.group(3).lower()
+    unit_to_minutes = {
+        "s": 1.0 / 60.0,
+        "m": 1.0,
+        "h": 60.0,
+        "d": 1440.0,
+        "w": 10080.0,
+    }
+    return sign * amount * unit_to_minutes[unit]
+
+
+def convert_tagval(expr: str, occurrences: List[InputOccurrence], base_interval_minutes: float) -> str:
+    """
+    Convert PI AF TagVal('TagName','*-1h') to RapidMiner lag([inp_TagName], steps).
+
+    PI TagVal is timestamp-based. RapidMiner lag is row/sample-based, so this
+    conversion uses base_interval_minutes to convert time offset to row lag.
+
+    Examples when base_interval_minutes = 60:
+      TagVal('Ethylene Storage Inventory','*-1h') -> lag([inp_Ethylene_Storage_Inventory], 1)
+      TagVal('ABC','*-2h')                       -> lag([inp_ABC], 2)
+
+    Examples when base_interval_minutes = 15:
+      TagVal('ABC','*-1h') -> lag([inp_ABC], 4)
+    """
+    if base_interval_minutes <= 0:
+        raise ValueError("TagVal base interval must be greater than 0 minutes.")
+
+    def conv(args: List[str], _name: str) -> str:
+        if len(args) < 2:
+            return f"{CHECK_TAGVAL_PREFIX}TagVal({', '.join(args)})"
+
+        raw_tag = strip_outer_quotes(args[0])
+        raw_time_arg = args[1]
+        offset_minutes = parse_pi_time_offset_minutes(raw_time_arg)
+
+        original, value, rm_name = rapidminer_input_name(raw_tag)
+        occurrences.append(InputOccurrence(original, value, rm_name))
+
+        if offset_minutes is None:
+            # Keep enough detail for manual correction instead of silently creating bad logic.
+            return f"{CHECK_TAGVAL_PREFIX}TagVal([{rm_name}], {raw_time_arg})"
+
+        if offset_minutes == 0:
+            return f"[{rm_name}]"
+
+        if offset_minutes > 0:
+            # Positive future lookups cannot be represented by lag; flag for review.
+            steps_float = offset_minutes / base_interval_minutes
+            return f"{CHECK_TAGVAL_PREFIX}lead([{rm_name}], {steps_float:g})"
+
+        steps_float = abs(offset_minutes) / base_interval_minutes
+        steps_int = int(round(steps_float))
+
+        if abs(steps_float - steps_int) < 1e-9 and steps_int >= 0:
+            return f"lag([{rm_name}], {steps_int})"
+
+        # Non-integer lag rows are unsafe because RapidMiner lag is row-based.
+        return f"{CHECK_TAGVAL_INTERVAL_PREFIX}lag([{rm_name}], {steps_float:g})"
+
+    return replace_function_calls(expr, ["TagVal"], conv)
+
+
+def convert_total(expr: str) -> str:
+    """Convert PI Total(a,b,c) to RapidMiner sum(a,b,c)."""
+
+    def conv(args: List[str], _name: str) -> str:
+        args = [a for a in args if a.strip()]
+        if not args:
+            return "MISSING_NUMERIC"
+        return f"sum({', '.join(args)})"
+
+    return replace_function_calls(expr, ["Total"], conv)
+
+
+def convert_badval(expr: str) -> str:
+    """Convert BadVal(x) to missing(x)."""
+
+    def conv(args: List[str], _name: str) -> str:
+        if not args:
+            return "missing(MISSING_NUMERIC)"
+        return f"missing({args[0]})"
+
+    return replace_function_calls(expr, ["BadVal"], conv)
+
+
+def convert_median(expr: str) -> str:
+    """Convert Median(lo, val, hi) to min(max(val, lo), hi)."""
+
+    def conv(args: List[str], _name: str) -> str:
+        if len(args) >= 3:
+            lo, val, hi = args[0], args[1], args[2]
+            return f"min(max({val}, {lo}), {hi})"
+        # If Median is malformed, keep it obvious for manual checking.
+        return f"CHECK_MEDIAN_ARGS__Median({', '.join(args)})"
+
+    return replace_function_calls(expr, ["Median"], conv)
+
+
+def convert_average(expr: str) -> str:
+    """Convert Avg/Average(a,b,c) to ((a + b + c) / 3)."""
+
+    def conv(args: List[str], _name: str) -> str:
+        args = [a for a in args if a.strip()]
+        if not args:
+            return "MISSING_NUMERIC"
+        if len(args) == 1:
+            return args[0]
+        return f"(({ ' + '.join(args) }) / {len(args)})"
+
+    return replace_function_calls(expr, ["Average", "Avg"], conv)
+
+
+def replace_nooutput(expr: str) -> str:
+    return re.sub(r"\bNoOutput\s*\(\s*\)", "MISSING_NUMERIC", expr, flags=re.IGNORECASE)
+
+
+def replace_logical_operators(expr: str) -> str:
+    """Convert PI logical operators to RapidMiner-style operators."""
+    expr = re.sub(r"\bAND\b", "&&", expr, flags=re.IGNORECASE)
+    expr = re.sub(r"\bOR\b", "||", expr, flags=re.IGNORECASE)
+    expr = re.sub(r"\bNOT\b", "!", expr, flags=re.IGNORECASE)
+    return expr
+
+
+def replace_comparison_operators(expr: str) -> str:
+    """Convert PI comparison operators without corrupting >=, <=, !=, or ==."""
+    expr = expr.replace("<>", "!=")
+    expr = re.sub(r"(?<![<>=!])=(?![=])", "==", expr)
+    return expr
+
+
+def convert_internal_variables(expr: str) -> str:
+    """
+    Convert PI internal variables like vABC to RapidMiner [ABC].
+
+    The scanner avoids changing text already inside [attribute] brackets or double-quoted strings.
+    """
+    token_pattern = re.compile(r"\b[vV](?=[A-Z_]|v[A-Z])[A-Za-z0-9_]*\b")
+    out: List[str] = []
+    pos = 0
+    bracket = 0
+    in_double = False
+    escape = False
+
+    i = 0
+    while i < len(expr):
+        ch = expr[i]
+        if in_double:
+            if ch == "\\" and not escape:
+                escape = True
+                i += 1
+                continue
+            if ch == '"' and not escape:
+                in_double = False
+            escape = False
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch == "[":
+            bracket += 1
+            i += 1
+            continue
+        if ch == "]" and bracket > 0:
+            bracket -= 1
+            i += 1
+            continue
+        i += 1
+
+    # Easier and safer to rebuild with regex while checking whether each match lies in a protected range.
+    protected = build_protected_ranges(expr)
+
+    def in_protected(idx: int) -> bool:
+        return any(start <= idx < end for start, end in protected)
+
+    result = []
+    last = 0
+    for match in token_pattern.finditer(expr):
+        if in_protected(match.start()):
+            continue
+        result.append(expr[last: match.start()])
+        result.append(f"[{rapidminer_output_name(match.group(0))}]")
+        last = match.end()
+    result.append(expr[last:])
+    return "".join(result)
+
+
+def build_protected_ranges(expr: str) -> List[Tuple[int, int]]:
+    """Return ranges inside [attributes] and double-quoted strings."""
+    ranges: List[Tuple[int, int]] = []
+    i = 0
+    while i < len(expr):
+        if expr[i] == "[":
+            start = i
+            end = expr.find("]", i + 1)
+            if end == -1:
+                break
+            ranges.append((start, end + 1))
+            i = end + 1
+            continue
+        if expr[i] == '"':
+            start = i
+            i += 1
+            escape = False
+            while i < len(expr):
+                if expr[i] == "\\" and not escape:
+                    escape = True
+                    i += 1
+                    continue
+                if expr[i] == '"' and not escape:
+                    i += 1
+                    break
+                escape = False
+                i += 1
+            ranges.append((start, i))
+            continue
+        i += 1
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# PI IF -> RapidMiner if(condition, true_value, false_value)
+# ---------------------------------------------------------------------------
+
+
+def is_word_at(expr: str, idx: int, word: str) -> bool:
+    """Case-insensitive whole-word match at idx."""
+    if idx < 0 or idx + len(word) > len(expr):
+        return False
+    if expr[idx: idx + len(word)].lower() != word.lower():
+        return False
+    before = expr[idx - 1] if idx > 0 else ""
+    after = expr[idx + len(word)] if idx + len(word) < len(expr) else ""
+    if before and (before.isalnum() or before == "_"):
+        return False
+    if after and (after.isalnum() or after == "_"):
+        return False
+    return True
+
+
+def protected_at(expr: str, idx: int, ranges: List[Tuple[int, int]]) -> bool:
+    return any(start <= idx < end for start, end in ranges)
+
+
+def paren_depth_at(expr: str, idx: int) -> int:
+    """Parenthesis depth at idx, ignoring [attributes] and double-quoted strings."""
+    depth = 0
+    protected = build_protected_ranges(expr)
+    p_iter = iter(protected)
+    ranges = protected
+    i = 0
+    while i < idx:
+        if protected_at(expr, i, ranges):
+            # Jump to the end of the protected range.
+            for start, end in ranges:
+                if start == i:
+                    i = end
+                    break
+            else:
+                i += 1
+            continue
+        if expr[i] == "(":
+            depth += 1
+        elif expr[i] == ")" and depth > 0:
+            depth -= 1
+        i += 1
+    return depth
+
+
+def find_next_pi_if(expr: str, start: int = 0) -> int:
+    """Find the next PI IF keyword that is not already RapidMiner if(...)."""
+    ranges = build_protected_ranges(expr)
+    i = start
+    while i < len(expr):
+        if protected_at(expr, i, ranges):
+            i += 1
+            continue
+        if is_word_at(expr, i, "If"):
+            # Return every IF-like token. Already converted RapidMiner if(...) calls
+            # simply will not have a matching THEN/ELSE, so convert_pi_if will skip them.
+            # This is necessary because valid PI AF syntax may be lowercase if(... ) Then ...
+            return i
+        i += 1
+    return -1
+
+
+def find_then_for_if(expr: str, if_idx: int) -> int:
+    """Find the THEN that belongs to an IF condition."""
+    ranges = build_protected_ranges(expr)
+    i = if_idx + 2
+    nested_if = 0
+    while i < len(expr):
+        if protected_at(expr, i, ranges):
+            i += 1
+            continue
+        if is_word_at(expr, i, "If"):
+            nested_if += 1
+            i += 2
+            continue
+        if is_word_at(expr, i, "Then"):
+            if nested_if == 0:
+                return i
+            i += 4
+            continue
+        i += 1
+    return -1
+
+
+def find_else_for_if(expr: str, then_idx: int) -> int:
+    """Find the ELSE that belongs to an IF after THEN."""
+    ranges = build_protected_ranges(expr)
+    i = then_idx + 4
+    nested_if = 0
+    while i < len(expr):
+        if protected_at(expr, i, ranges):
+            i += 1
+            continue
+        if is_word_at(expr, i, "If"):
+            nested_if += 1
+            i += 2
+            continue
+        if is_word_at(expr, i, "Else"):
+            if nested_if == 0:
+                return i
+            nested_if -= 1
+            i += 4
+            continue
+        i += 1
+    return -1
+
+
+def find_if_false_end(expr: str, else_value_start: int, base_depth: int) -> int:
+    """
+    Find where the false branch ends.
+
+    Stops before a top-level comma or a closing parenthesis that belongs to the
+    expression outside the IF. This lets expressions like:
+      Median(lo, If A Then B Else C, hi)
+    become:
+      Median(lo, if(A, B, C), hi)
+    instead of consuming ', hi'.
+    """
+    ranges = build_protected_ranges(expr)
+    depth = paren_depth_at(expr, else_value_start)
+    nested_if = 0
+    i = else_value_start
+
+    while i < len(expr):
+        if protected_at(expr, i, ranges):
+            i += 1
+            continue
+        if is_word_at(expr, i, "If"):
+            nested_if += 1
+            i += 2
+            continue
+        if is_word_at(expr, i, "Else") and nested_if > 0:
+            nested_if -= 1
+            i += 4
+            continue
+        ch = expr[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            # If this parenthesis closes an outer expression, the IF branch ends before it.
+            if depth == base_depth:
+                return i
+            if depth > 0:
+                depth -= 1
+        elif ch == "," and depth == base_depth and nested_if == 0:
+            return i
+        i += 1
+    return len(expr)
+
+
+def convert_pi_if(expr: str) -> str:
+    """Convert all PI AF IF/THEN/ELSE expressions to RapidMiner if(...)."""
+    search_pos = 0
+    while True:
+        if_idx = find_next_pi_if(expr, search_pos)
+        if if_idx == -1:
+            return expr
+
+        then_idx = find_then_for_if(expr, if_idx)
+        if then_idx == -1:
+            # Could not safely parse. Leave for final CHECK_IF_CONVERSION__ guard.
+            search_pos = if_idx + 2
+            continue
+
+        else_idx = find_else_for_if(expr, then_idx)
+        if else_idx == -1:
+            search_pos = then_idx + 4
+            continue
+
+        base_depth = paren_depth_at(expr, if_idx)
+        false_start = else_idx + 4
+        false_end = find_if_false_end(expr, false_start, base_depth)
+
+        condition = expr[if_idx + 2: then_idx].strip()
+        true_value = expr[then_idx + 4: else_idx].strip()
+        false_value = expr[false_start: false_end].strip()
+
+        # Recursively convert nested IFs inside each segment.
+        condition = convert_pi_if(condition)
+        true_value = convert_pi_if(true_value)
+        false_value = convert_pi_if(false_value)
+
+        replacement = f"if({condition}, {true_value}, {false_value})"
+        expr = expr[:if_idx] + replacement + expr[false_end:]
+        search_pos = if_idx + len(replacement)
+
+
+def convert_formula_to_rapidminer(formula: str, tagval_base_interval_minutes: float = 60.0) -> Tuple[str, List[InputOccurrence]]:
+    """Convert one PI AF formula RHS to RapidMiner syntax and return input occurrences."""
+    occurrences: List[InputOccurrence] = []
+    expr = clean_config_string(formula)
+
+    # Input references first, so PI tags become stable [inp_*] tokens.
+    # TagVal must be converted before generic quoted-tag replacement, otherwise
+    # its time argument like '*-1h' would incorrectly become an input.
+    expr = convert_tagval(expr, occurrences, base_interval_minutes=tagval_base_interval_minutes)
+    expr = replace_prevval_calls(expr, occurrences)
+    expr = replace_quoted_pi_tags(expr, occurrences)
+
+    # Structural/function conversions.
+    expr = convert_pi_if(expr)
+    expr = replace_nooutput(expr)
+    expr = convert_badval(expr)
+    expr = convert_median(expr)
+    expr = convert_average(expr)
+    expr = convert_total(expr)
+
+    # Variable and operator conversions.
+    expr = convert_internal_variables(expr)
+    expr = replace_logical_operators(expr)
+    expr = replace_comparison_operators(expr)
+
+    # Final safety check: any surviving Then/Else indicates IF parsing ambiguity.
+    if re.search(r"\b(Then|Else)\b", expr, flags=re.IGNORECASE):
+        expr = CHECK_PREFIX + expr
+
+    return expr.strip(), occurrences
+
+
+# ---------------------------------------------------------------------------
+# Workbook output helpers
+# ---------------------------------------------------------------------------
+
+
+def make_unique_sheet_name(base: str, existing: set) -> str:
+    """Create a valid, unique Excel sheet name up to 31 chars."""
+    cleaned = re.sub(r"[\\/*?:\[\]]", "_", s(base).strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip() or "Analysis"
+    cleaned = cleaned[:31]
+    candidate = cleaned
+    i = 1
+    while candidate in existing:
+        suffix = f"_{i}"
+        candidate = cleaned[: 31 - len(suffix)] + suffix
+        i += 1
+    existing.add(candidate)
+    return candidate
+
+
+def append_rows(ws, headers: Sequence[str], rows: Iterable[Sequence]) -> None:
+    """Append header and rows to a worksheet."""
+    ws.append(list(headers))
+    for row in rows:
+        ws.append([safe_excel_value(v) for v in row])
+
+
+def style_sheet(ws, freeze: str = "A2", auto_filter: bool = True, wrap_cols: Optional[Iterable[int]] = None) -> None:
+    """Apply professional-but-light formatting and safe column widths."""
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    border = Border(bottom=Side(style="thin", color="BFBFBF"))
+
+    if ws.max_row >= 1:
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        ws.freeze_panes = freeze
+        if auto_filter and ws.max_column >= 1:
+            ws.auto_filter.ref = ws.dimensions
+
+    wrap_cols = set(wrap_cols or [])
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 0
+        for row in range(1, min(ws.max_row, 300) + 1):
+            val = ws.cell(row=row, column=col_idx).value
+            max_len = max(max_len, len(s(val)))
+        width = min(max(max_len + 2, 10), 60)
+        if col_idx in wrap_cols:
+            width = min(max(width, 25), 80)
+            for row in range(2, ws.max_row + 1):
+                ws.cell(row=row, column=col_idx).alignment = Alignment(wrap_text=True, vertical="top")
+        ws.column_dimensions[letter].width = width
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            if cell.alignment is None or not cell.alignment.wrap_text:
+                cell.alignment = Alignment(vertical="top")
+
+
+def write_kv_summary(ws, metrics: List[Tuple[str, str]], issues: List[Tuple[str, str, int, str, str, str]]) -> None:
+    """Write RapidMiner_Conversion_Summary sheet."""
+    ws.append(["Metric", "Value"])
+    for key, value in metrics:
+        ws.append([key, value])
+
+    start = ws.max_row + 3
+    ws.cell(row=start, column=1, value="Issue_Type")
+    ws.cell(row=start, column=2, value="Source_Sheet")
+    ws.cell(row=start, column=3, value="Source_Row")
+    ws.cell(row=start, column=4, value="Analysis_Name")
+    ws.cell(row=start, column=5, value="RapidMiner_Name")
+    ws.cell(row=start, column=6, value="Detail")
+
+    if issues:
+        for issue in issues:
+            ws.append(list(issue))
+    else:
+        ws.append(["None", "", "", "", "", "No Excel error strings or CHECK_IF_CONVERSION__ rows found."])
+
+    # Style first header row and issue header row.
+    header_fill = PatternFill("solid", fgColor="1F4E78")
+    header_font = Font(color="FFFFFF", bold=True)
+    for cell in ws[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    for cell in ws[start]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A2"
+
+    for col_idx in range(1, ws.max_column + 1):
+        letter = get_column_letter(col_idx)
+        max_len = 0
+        for row in range(1, min(ws.max_row, 300) + 1):
+            max_len = max(max_len, len(s(ws.cell(row=row, column=col_idx).value)))
+        ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 70)
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+
+def build_output_workbook(input_path: Path, output_path: Path, sheet_name: Optional[str] = None, tagval_base_interval_minutes: float = 60.0) -> None:
+    input_wb = load_workbook(input_path, data_only=False, read_only=False)
+    if sheet_name:
+        if sheet_name not in input_wb.sheetnames:
+            raise ValueError(f"Sheet '{sheet_name}' not found. Available sheets: {input_wb.sheetnames}")
+        src_ws = input_wb[sheet_name]
+    else:
+        src_ws = input_wb[input_wb.sheetnames[0]]
+
+    name_col, formula_col, mapping_col = find_input_columns(src_ws)
+
+    out_wb = Workbook()
+    # Remove default sheet; we will create all sheets explicitly.
+    default_ws = out_wb.active
+    out_wb.remove(default_ws)
+
+    all_formula_rows: List[FormulaRow] = []
+    summaries: List[AnalysisSummary] = []
+    sheet_names = set()
+    analysis_sheet_rows: Dict[str, List[FormulaRow]] = {}
+
+    for row_idx in range(2, src_ws.max_row + 1):
+        analysis_name = s(src_ws.cell(row=row_idx, column=name_col).value).strip()
+        formula_config = s(src_ws.cell(row=row_idx, column=formula_col).value)
+        mapping_config = s(src_ws.cell(row=row_idx, column=mapping_col).value)
+
+        if not analysis_name and not formula_config and not mapping_config:
+            continue
+        if not analysis_name:
+            analysis_name = f"Analysis_Row_{row_idx}"
+
+        formula_pairs = parse_formula_config(formula_config)
+        mapping_rows = parse_variable_mapping(mapping_config)
+        lookup = mapping_lookup(mapping_rows)
+
+        out_sheet_name = make_unique_sheet_name(f"A{row_idx-1}_{analysis_name}", sheet_names)
+        matched = 0
+        current_rows: List[FormulaRow] = []
+
+        for variable, formula in formula_pairs:
+            mapping_attr = find_mapping_for_variable(variable, lookup)
+            if mapping_attr:
+                matched += 1
+            rapidminer_var = rapidminer_output_name(variable)
+            rapidminer_formula, inputs = convert_formula_to_rapidminer(formula, tagval_base_interval_minutes=tagval_base_interval_minutes)
+            fr = FormulaRow(
+                source_row=row_idx,
+                analysis_name=analysis_name,
+                variable_names=variable,
+                formulas=formula,
+                mapping_attribute=mapping_attr,
+                rapidminer_variable_name=rapidminer_var,
+                rapidminer_formula=rapidminer_formula,
+                input_occurrences=inputs,
+            )
+            current_rows.append(fr)
+            all_formula_rows.append(fr)
+
+        summaries.append(
+            AnalysisSummary(
+                analysis_name=analysis_name,
+                output_sheet_name=out_sheet_name,
+                formula_count=len(formula_pairs),
+                mapping_count=len(mapping_rows),
+                matched_mapping_count=matched,
+            )
+        )
+        analysis_sheet_rows[out_sheet_name] = current_rows
+
+    # 1. Summary
+    ws = out_wb.create_sheet("Summary")
+    append_rows(
+        ws,
+        ["Analysis_Name", "Output_Sheet_Name", "Formula_Count", "Mapping_Count", "Matched_Mapping_Count"],
+        [
+            [x.analysis_name, x.output_sheet_name, x.formula_count, x.mapping_count, x.matched_mapping_count]
+            for x in summaries
+        ],
+    )
+    style_sheet(ws)
+
+    # Optional but useful per-analysis sheets referenced by Summary.Output_Sheet_Name.
+    analysis_headers = [
+        "Source_Row",
+        "Analysis_Name",
+        "Variable_Names",
+        "Formulas",
+        "Mapping_Attribute",
+        "RapidMiner_Variable_Name",
+        "RapidMiner_Formula",
+    ]
+    for out_sheet_name, rows in analysis_sheet_rows.items():
+        ws = out_wb.create_sheet(out_sheet_name)
+        append_rows(
+            ws,
+            analysis_headers,
+            [
+                [
+                    r.source_row,
+                    r.analysis_name,
+                    r.variable_names,
+                    r.formulas,
+                    r.mapping_attribute,
+                    r.rapidminer_variable_name,
+                    r.rapidminer_formula,
+                ]
+                for r in rows
+            ],
+        )
+        style_sheet(ws, wrap_cols={4, 7})
+
+    # 2. Consolidated_All - preserve all rows and duplicates.
+    ws = out_wb.create_sheet("Consolidated_All")
+    append_rows(
+        ws,
+        [
+            "Analysis_Name",
+            "Variable_Names",
+            "Formulas",
+            "Mapping_Attribute",
+            "RapidMiner_Variable_Name",
+            "RapidMiner_Formula",
+        ],
+        [
+            [
+                r.analysis_name,
+                r.variable_names,
+                r.formulas,
+                r.mapping_attribute,
+                r.rapidminer_variable_name,
+                r.rapidminer_formula,
+            ]
+            for r in all_formula_rows
+        ],
+    )
+    style_sheet(ws, wrap_cols={3, 6})
+
+    # 3. Consolidated_All_RM_input - preserve all input occurrences and duplicates.
+    input_occurrence_rows = []
+    for r in all_formula_rows:
+        for occ in r.input_occurrences:
+            input_occurrence_rows.append(
+                [
+                    r.source_row,
+                    r.analysis_name,
+                    r.variable_names,
+                    r.rapidminer_variable_name,
+                    r.mapping_attribute,
+                    occ.original_input_name,
+                    occ.value,
+                    occ.rapidminer_input_name,
+                ]
+            )
+
+    ws = out_wb.create_sheet("Consolidated_All_RM_input")
+    append_rows(
+        ws,
+        [
+            "Source_Row",
+            "Analysis_Name",
+            "Variable_Names",
+            "RapidMiner_Variable_Name",
+            "Mapping_Attribute",
+            "Original_Input_Name",
+            "Value",
+            "RapidMiner_Input_Name",
+        ],
+        input_occurrence_rows,
+    )
+    style_sheet(ws)
+
+    # 5. Compiled_Formulas - preserve as present in Consolidated_All.
+    ws = out_wb.create_sheet("Compiled_Formulas")
+    append_rows(
+        ws,
+        ["Analysis_Name", "RapidMiner_Name", "RapidMiner_Formula"],
+        [[r.analysis_name, r.rapidminer_variable_name, r.rapidminer_formula] for r in all_formula_rows],
+    )
+    style_sheet(ws, wrap_cols={3})
+
+    # 6. Compiled_Inputs - unique master input list only.
+    unique_inputs: Dict[Tuple[str, str], Dict[str, object]] = {}
+    for row in input_occurrence_rows:
+        analysis_name = row[1]
+        original_name = row[5]
+        value = row[6]
+        rapidminer_name = row[7]
+        key = (original_name, rapidminer_name)
+        if key not in unique_inputs:
+            unique_inputs[key] = {
+                "analyses": [],
+                "original_name": original_name,
+                "value": value,
+                "rapidminer_name": rapidminer_name,
+            }
+        analyses: List[str] = unique_inputs[key]["analyses"]  # type: ignore[assignment]
+        if analysis_name not in analyses:
+            analyses.append(analysis_name)
+
+    ws = out_wb.create_sheet("Compiled_Inputs")
+    append_rows(
+        ws,
+        ["Analysis_Name", "Original_Name", "RapidMiner_Input_Name"],
+        [
+            ["; ".join(v["analyses"]), v["original_name"], v["rapidminer_name"]]
+            for _, v in sorted(unique_inputs.items(), key=lambda item: item[0][1])
+        ],
+    )
+    style_sheet(ws)
+
+    # 7. RapidMiner_Conversion_Summary
+    issues: List[Tuple[str, str, int, str, str, str]] = []
+    for idx, r in enumerate(all_formula_rows, start=2):  # row in Consolidated_All after header
+        combined_text = f"{r.formulas}\n{r.rapidminer_formula}"
+        for err in EXCEL_ERROR_STRINGS:
+            if err in combined_text:
+                issues.append(("Excel_Error_String", "Consolidated_All", idx, r.analysis_name, r.rapidminer_variable_name, f"{err}: {shorten(r.rapidminer_formula)}"))
+        if r.rapidminer_formula.startswith(CHECK_PREFIX):
+            issues.append(("CHECK_IF_CONVERSION__", "Consolidated_All", idx, r.analysis_name, r.rapidminer_variable_name, shorten(r.rapidminer_formula)))
+        if CHECK_TAGVAL_PREFIX in r.rapidminer_formula:
+            issues.append(("CHECK_TAGVAL_CONVERSION__", "Consolidated_All", idx, r.analysis_name, r.rapidminer_variable_name, shorten(r.rapidminer_formula)))
+        if CHECK_TAGVAL_INTERVAL_PREFIX in r.rapidminer_formula:
+            issues.append(("CHECK_TAGVAL_INTERVAL__", "Consolidated_All", idx, r.analysis_name, r.rapidminer_variable_name, shorten(r.rapidminer_formula)))
+
+    ws = out_wb.create_sheet("RapidMiner_Conversion_Summary")
+    metrics = [
+        ("Total RapidMiner formulas processed", str(len(all_formula_rows))),
+        ("Total RapidMiner input occurrences", str(len(input_occurrence_rows))),
+        ("Total unique RapidMiner inputs", str(len(unique_inputs))),
+        ("Consolidated_All duplicates removed", "No"),
+        ("Consolidated_All_RM_input duplicates removed", "No"),
+        ("Compiled_Inputs duplicates removed", "Yes, unique master list only"),
+        ("TagVal base interval minutes", str(tagval_base_interval_minutes)),
+        ("Rows marked CHECK_IF_CONVERSION__", str(sum(1 for r in all_formula_rows if r.rapidminer_formula.startswith(CHECK_PREFIX)))),
+        ("Rows marked CHECK_TAGVAL_CONVERSION__", str(sum(1 for r in all_formula_rows if CHECK_TAGVAL_PREFIX in r.rapidminer_formula))),
+        ("Rows marked CHECK_TAGVAL_INTERVAL__", str(sum(1 for r in all_formula_rows if CHECK_TAGVAL_INTERVAL_PREFIX in r.rapidminer_formula))),
+        ("Rows with Excel error strings", str(sum(1 for issue in issues if issue[0] == "Excel_Error_String"))),
+    ]
+    write_kv_summary(ws, metrics, issues)
+
+    # Save final workbook.
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out_wb.save(output_path)
+
+
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Convert PI AF Analysis Excel export to RapidMiner-ready Excel workbook."
+    )
+    parser.add_argument("--input", required=True, help="Input PI AF Excel export .xlsx file")
+    parser.add_argument("--output", required=True, help="Output RapidMiner-ready .xlsx file")
+    parser.add_argument("--sheet", default=None, help="Optional input sheet name. Defaults to the first sheet.")
+    parser.add_argument(
+        "--tagval-base-minutes",
+        type=float,
+        default=60.0,
+        help="Sampling interval in minutes for converting PI TagVal relative times to RapidMiner row lag. Default: 60.",
+    )
+    return parser.parse_args(argv)
+
+
+def validate_paths(input_path: Path, output_path: Path) -> None:
+    """Common validation used by both Jupyter and command-line modes."""
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+    if input_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise ValueError("Input must be an .xlsx or .xlsm workbook.")
+    if output_path.suffix.lower() not in {".xlsx", ".xlsm"}:
+        raise ValueError("Output must be an .xlsx or .xlsm workbook.")
+
+
+def run_pipeline(
+    input_file: str | Path = JUPYTER_INPUT_FILE,
+    output_file: str | Path = JUPYTER_OUTPUT_FILE,
+    sheet_name: Optional[str] = JUPYTER_SHEET_NAME,
+    tagval_base_interval_minutes: float = JUPYTER_TAGVAL_BASE_INTERVAL_MINUTES,
+) -> Path:
+    """
+    Jupyter-friendly runner.
+
+    In Notebook, you can call:
+        run_pipeline(
+            input_file=r"D:\\Your_Folder\\sample_analysis.xlsx",
+            output_file=r"D:\\Your_Folder\\pi_af_analysis_rapidminer_final.xlsx",
+            sheet_name=None,
+            tagval_base_interval_minutes=60.0,
+        )
+
+    Or simply update JUPYTER_INPUT_FILE / JUPYTER_OUTPUT_FILE above and run the script.
+    """
+    input_path = Path(input_file)
+    output_path = Path(output_file)
+
+    validate_paths(input_path, output_path)
+    build_output_workbook(input_path=input_path, output_path=output_path, sheet_name=sheet_name, tagval_base_interval_minutes=tagval_base_interval_minutes)
+
+    print("RapidMiner-ready workbook created successfully.")
+    print(f"Input : {input_path}")
+    print(f"Output: {output_path}")
+    if sheet_name:
+        print(f"Sheet : {sheet_name}")
+    else:
+        print("Sheet : first sheet in workbook")
+    print(f"TagVal base interval minutes: {tagval_base_interval_minutes}")
+
+    return output_path
+
+
+def running_inside_jupyter() -> bool:
+    """Return True when the script is being executed by a Jupyter/IPython kernel."""
+    try:
+        from IPython import get_ipython  # type: ignore
+
+        shell = get_ipython()
+        if shell is None:
+            return False
+        shell_name = shell.__class__.__name__
+        return shell_name in {"ZMQInteractiveShell", "Shell"} or "ipykernel" in sys.modules
+    except Exception:
+        return False
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Command-line runner using argparse."""
+    args = parse_args(argv)
+    input_path = Path(args.input)
+    output_path = Path(args.output)
+
+    try:
+        validate_paths(input_path, output_path)
+        build_output_workbook(input_path=input_path, output_path=output_path, sheet_name=args.sheet, tagval_base_interval_minutes=args.tagval_base_minutes)
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Created RapidMiner-ready workbook: {output_path}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Execution entry point
+# ---------------------------------------------------------------------------
+# Command prompt:
+#   python pi_af_full_pipeline_jupyter_updated.py --input sample_analysis.xlsx --output final.xlsx
+#
+# Jupyter Notebook:
+#   Edit JUPYTER_INPUT_FILE / JUPYTER_OUTPUT_FILE / JUPYTER_SHEET_NAME above,
+#   then run the full cell/script. It will automatically use run_pipeline().
+
+if __name__ == "__main__":
+    if running_inside_jupyter():
+        if RUN_AUTOMATICALLY_IN_JUPYTER:
+            run_pipeline(
+                input_file=JUPYTER_INPUT_FILE,
+                output_file=JUPYTER_OUTPUT_FILE,
+                sheet_name=JUPYTER_SHEET_NAME,
+                tagval_base_interval_minutes=JUPYTER_TAGVAL_BASE_INTERVAL_MINUTES,
+            )
+        else:
+            print("Jupyter mode detected. RUN_AUTOMATICALLY_IN_JUPYTER is False, so no file was created.")
+            print("Call run_pipeline(input_file=..., output_file=..., sheet_name=...) manually.")
+    else:
+        raise SystemExit(main())
