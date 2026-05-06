@@ -361,3 +361,24 @@ def rebuild_consolidated_all_sheet(wb, processed_sheet_names):
             total_rows_added += 1
 
     return total_rows_added
+---------------------------
+
+plt.figure(figsize=(10,6))
+plt.scatter(df['Timestamp'], df['CWS_Pressure'], color='blue', label='CWS_Pressure')
+plt.xlabel("Timestamp")
+plt.ylabel("CWS_Pressure")
+
+# Example ranges (replace with your actual datetime values)
+high_ranges = [
+    ('2023-04-01', '2023-07-01'),
+    ('2023-12-15', '2024-01-31')
+]
+
+for start, end in high_ranges:
+    plt.axvspan(pd.to_datetime(start), pd.to_datetime(end),
+                ymin=(5-4.25)/(5.75-4.25), ymax=1,  # vertical span from 5 to 5.75
+                color='pink', alpha=0.4)
+
+plt.legend()
+plt.show()
+ 
